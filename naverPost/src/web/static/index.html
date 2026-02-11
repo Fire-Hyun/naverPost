@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>네이버 블로그 포스팅 자동화 시스템</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        .upload-area {
+            border: 2px dashed #007bff;
+            border-radius: 10px;
+            padding: 40px;
+            text-align: center;
+            background-color: #f8f9fa;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        .upload-area:hover {
+            background-color: #e9ecef;
+        }
+        .upload-area.dragover {
+            border-color: #28a745;
+            background-color: #d4edda;
+        }
+        .image-preview {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 20px;
+        }
+        .image-item {
+            position: relative;
+            width: 150px;
+            height: 150px;
+            border-radius: 10px;
+            overflow: hidden;
+            border: 2px solid #dee2e6;
+        }
+        .image-item img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        .image-item .remove-btn {
+            position: absolute;
+            top: 5px;
+            right: 5px;
+            background: rgba(220, 53, 69, 0.8);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 25px;
+            height: 25px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+        }
+        .status-message {
+            margin-top: 20px;
+        }
+        .form-section {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .section-title {
+            color: #495057;
+            border-bottom: 2px solid #007bff;
+            padding-bottom: 10px;
+            margin-bottom: 25px;
+        }
+    </style>
+</head>
+<body class="bg-light">
+    <div class="container py-5">
+        <div class="row">
+            <div class="col-md-12">
+                <div class="text-center mb-5">
+                    <h1 class="display-4 text-primary">
+                        <i class="fas fa-blog me-3"></i>
+                        네이버 블로그 포스팅 자동화 시스템
+                    </h1>
+                    <p class="lead">사용자 경험 기반 고품질 블로그 포스트 생성</p>
+                </div>
+
+                <!-- 이미지 업로드 섹션 -->
+                <div class="form-section">
+                    <h3 class="section-title">
+                        <i class="fas fa-images me-2"></i>
+                        이미지 업로드
+                    </h3>
+
+                    <div class="upload-area" id="uploadArea">
+                        <i class="fas fa-cloud-upload-alt fa-3x text-primary mb-3"></i>
+                        <h5>이미지를 드래그하거나 클릭하여 업로드</h5>
+                        <p class="text-muted">최대 10개, 각 파일당 최대 50MB</p>
+                        <input type="file" id="imageInput" multiple accept="image/*" class="d-none">
+                        <button type="button" class="btn btn-primary mt-3" onclick="document.getElementById('imageInput').click()">
+                            <i class="fas fa-plus me-2"></i>이미지 선택
+                        </button>
+                    </div>
+
+                    <div class="image-preview" id="imagePreview"></div>
+                    <div class="status-message" id="uploadStatus"></div>
+                </div>
+
+                <!-- 사용자 경험 입력 섹션 -->
+                <div class="form-section">
+                    <h3 class="section-title">
+                        <i class="fas fa-user-edit me-2"></i>
+                        사용자 경험 정보
+                    </h3>
+
+                    <form id="experienceForm">
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label for="category" class="form-label">카테고리 *</label>
+                                <select class="form-select" id="category" required>
+                                    <option value="">카테고리를 선택하세요</option>
+                                    <option value="맛집">맛집</option>
+                                    <option value="제품">제품</option>
+                                    <option value="호텔">호텔</option>
+                                    <option value="여행">여행</option>
+                                    <option value="뷰티">뷰티</option>
+                                    <option value="패션">패션</option>
+                                    <option value="IT">IT</option>
+                                    <option value="기타">기타</option>
+                                </select>
+                            </div>
+
+                            <div class="col-md-6 mb-3">
+                                <label for="rating" class="form-label">별점</label>
+                                <select class="form-select" id="rating">
+                                    <option value="">별점을 선택하세요</option>
+                                    <option value="5">⭐⭐⭐⭐⭐ (5점)</option>
+                                    <option value="4">⭐⭐⭐⭐ (4점)</option>
+                                    <option value="3">⭐⭐⭐ (3점)</option>
+                                    <option value="2">⭐⭐ (2점)</option>
+                                    <option value="1">⭐ (1점)</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label for="location" class="form-label">위치</label>
+                                <input type="text" class="form-control" id="location" placeholder="예: 서울 강남구 신사동">
+                            </div>
+
+                            <div class="col-md-6 mb-3">
+                                <label for="visitDate" class="form-label">방문/사용 날짜</label>
+                                <input type="date" class="form-control" id="visitDate">
+                            </div>
+                        </div>
+
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label for="companion" class="form-label">동행자</label>
+                                <select class="form-select" id="companion">
+                                    <option value="">선택하세요</option>
+                                    <option value="혼자">혼자</option>
+                                    <option value="가족">가족</option>
+                                    <option value="친구">친구</option>
+                                    <option value="연인">연인</option>
+                                    <option value="동료">동료</option>
+                                </select>
+                            </div>
+
+                            <div class="col-md-6 mb-3">
+                                <label for="hashtags" class="form-label">해시태그</label>
+                                <input type="text" class="form-control" id="hashtags" placeholder="#맛집 #추천 (쉼표로 구분)">
+                            </div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label for="personalReview" class="form-label">개인 감상평 *</label>
+                            <textarea class="form-control" id="personalReview" rows="5" required
+                                placeholder="직접 경험한 내용을 자세히 작성해주세요. (최소 50자)"></textarea>
+                            <div class="form-text">개인적인 경험과 감정을 솔직하게 작성해주세요.</div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label for="additionalNotes" class="form-label">추가 메모</label>
+                            <textarea class="form-control" id="additionalNotes" rows="3"
+                                placeholder="추가로 포함하고 싶은 내용이 있다면 작성해주세요."></textarea>
+                        </div>
+
+                        <div class="d-grid gap-2">
+                            <button type="submit" class="btn btn-success btn-lg">
+                                <i class="fas fa-magic me-2"></i>
+                                블로그 포스트 생성하기
+                            </button>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- 결과 섹션 -->
+                <div class="form-section d-none" id="resultSection">
+                    <h3 class="section-title">
+                        <i class="fas fa-file-alt me-2"></i>
+                        생성된 블로그 포스트
+                    </h3>
+                    <div id="generatedContent"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        let uploadedImages = [];
+
+        // 파일 업로드 관련 이벤트
+        const uploadArea = document.getElementById('uploadArea');
+        const imageInput = document.getElementById('imageInput');
+        const imagePreview = document.getElementById('imagePreview');
+        const uploadStatus = document.getElementById('uploadStatus');
+
+        uploadArea.addEventListener('click', () => imageInput.click());
+        uploadArea.addEventListener('dragover', handleDragOver);
+        uploadArea.addEventListener('dragleave', handleDragLeave);
+        uploadArea.addEventListener('drop', handleDrop);
+        imageInput.addEventListener('change', handleFileSelect);
+
+        function handleDragOver(e) {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        }
+
+        function handleDragLeave(e) {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+        }
+
+        function handleDrop(e) {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            const files = Array.from(e.dataTransfer.files);
+            uploadFiles(files);
+        }
+
+        function handleFileSelect(e) {
+            const files = Array.from(e.target.files);
+            uploadFiles(files);
+        }
+
+        async function uploadFiles(files) {
+            const formData = new FormData();
+            files.forEach(file => formData.append('files', file));
+
+            try {
+                showStatus('이미지 업로드 중...', 'info');
+
+                const response = await fetch('/api/upload/images', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    uploadedImages.push(...result.uploaded_files);
+                    updateImagePreview();
+                    showStatus(result.message, 'success');
+                } else {
+                    showStatus('업로드 실패: ' + result.message, 'error');
+                }
+            } catch (error) {
+                showStatus('업로드 중 오류가 발생했습니다: ' + error.message, 'error');
+            }
+        }
+
+        function updateImagePreview() {
+            imagePreview.innerHTML = '';
+            uploadedImages.forEach((image, index) => {
+                const imageItem = document.createElement('div');
+                imageItem.className = 'image-item';
+                imageItem.innerHTML = `
+                    <img src="${image.url}" alt="업로드된 이미지">
+                    <button type="button" class="remove-btn" onclick="removeImage(${index})">
+                        <i class="fas fa-times"></i>
+                    </button>
+                `;
+                imagePreview.appendChild(imageItem);
+            });
+        }
+
+        function removeImage(index) {
+            uploadedImages.splice(index, 1);
+            updateImagePreview();
+        }
+
+        function showStatus(message, type) {
+            const alertClass = type === 'success' ? 'alert-success' :
+                             type === 'error' ? 'alert-danger' : 'alert-info';
+
+            uploadStatus.innerHTML = `
+                <div class="alert ${alertClass} alert-dismissible fade show" role="alert">
+                    ${message}
+                    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                </div>
+            `;
+        }
+
+        // 폼 제출 처리
+        document.getElementById('experienceForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+
+            if (uploadedImages.length === 0) {
+                showStatus('최소 1개의 이미지를 업로드해주세요.', 'error');
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('images', JSON.stringify(uploadedImages.map(img => img.saved_path)));
+            formData.append('category', document.getElementById('category').value);
+            formData.append('personal_review', document.getElementById('personalReview').value);
+            formData.append('additional_notes', document.getElementById('additionalNotes').value);
+            formData.append('location', document.getElementById('location').value);
+            formData.append('hashtags', JSON.stringify(
+                document.getElementById('hashtags').value
+                    .split(',')
+                    .map(tag => tag.trim())
+                    .filter(tag => tag.length > 0)
+            ));
+            formData.append('rating', document.getElementById('rating').value);
+            formData.append('visit_date', document.getElementById('visitDate').value);
+            formData.append('companion', document.getElementById('companion').value);
+
+            try {
+                showStatus('사용자 경험 데이터를 처리 중...', 'info');
+
+                const response = await fetch('/api/user-experience', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    showStatus('사용자 경험 데이터가 성공적으로 생성되었습니다!', 'success');
+                    // TODO: 다음 단계 (블로그 포스트 생성) 구현
+                } else {
+                    showStatus('처리 실패: ' + result.message, 'error');
+                }
+            } catch (error) {
+                showStatus('처리 중 오류가 발생했습니다: ' + error.message, 'error');
+            }
+        });
+
+        // 페이지 로드 시 설정 정보 조회
+        async function loadSettings() {
+            try {
+                const response = await fetch('/api/uploads/status');
+                const settings = await response.json();
+
+                // UI에 설정 정보 반영 (예: 최대 파일 크기 표시)
+                const uploadAreaText = document.querySelector('.upload-area p');
+                uploadAreaText.textContent = `최대 ${settings.max_images_per_post}개, 각 파일당 최대 ${settings.max_file_size_mb}MB`;
+            } catch (error) {
+                console.error('설정 정보 로드 실패:', error);
+            }
+        }
+
+        // 페이지 로드 완료 시 실행
+        document.addEventListener('DOMContentLoaded', loadSettings);
+    </script>
+</body>
+</html>
