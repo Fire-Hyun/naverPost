@@ -133,7 +133,7 @@ python3 test_structure.py
 uvicorn src.web.app:app --host 0.0.0.0 --port 8000 --reload
 
 # 또는 Python 모듈로 실행
-python -m src.web.app
+python3 -m src.web.app
 ```
 
 브라우저에서 `http://localhost:8000`에 접속하여 웹 인터페이스를 사용할 수 있습니다.

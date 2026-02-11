@@ -194,3 +194,22 @@ class AuthenticationError(APIError):
     def __init__(self, message: str, api_name: str = ""):
         super().__init__(message, api_name, 401)
         self.details = "Invalid API key or credentials"
+
+
+class DataConsistencyError(BlogSystemError):
+    """데이터 일관성 오류 예외"""
+
+    def __init__(self, message: str, data_type: str = "", expected: str = "", actual: str = ""):
+        self.data_type = data_type
+        self.expected = expected
+        self.actual = actual
+        super().__init__(message, "DATA_CONSISTENCY")
+        details_parts = []
+        if data_type:
+            details_parts.append(f"Type: {data_type}")
+        if expected:
+            details_parts.append(f"Expected: {expected}")
+        if actual:
+            details_parts.append(f"Actual: {actual}")
+        if details_parts:
+            self.details = ", ".join(details_parts)
