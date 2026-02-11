@@ -5,6 +5,7 @@ FastAPI 기반 웹 서버를 제공합니다.
 
 import logging
 import os
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -46,12 +47,24 @@ except ConfigurationError as e:
     if not Settings.WEB_DEBUG:
         raise
 
+# Lifespan 이벤트 핸들러
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """애플리케이션 시작 및 종료 이벤트 처리"""
+    # Startup
+    web_logger.info(f"Starting Naver Blog Automation System on {Settings.WEB_HOST}:{Settings.WEB_PORT}")
+    web_logger.info(f"Debug mode: {Settings.WEB_DEBUG}")
+    yield
+    # Shutdown
+    web_logger.info("Shutting down Naver Blog Automation System")
+
 # FastAPI 앱 생성
 app = FastAPI(
     title="네이버 블로그 포스팅 자동화 시스템",
     description="사용자 경험 기반 고품질 블로그 포스트 생성 및 자동 업로드",
     version="1.0.0",
     servers=[{"url": f"http://{Settings.WEB_HOST}:{Settings.WEB_PORT}"}],
+    lifespan=lifespan,
 )
 
 # CORS 설정
@@ -144,16 +157,6 @@ async def general_exception_handler(request: Request, exc: Exception) -> JSONRes
         }
     )
 
-# 서버 시작 시 로그
-@app.on_event("startup")
-async def startup_event():
-    web_logger.info(f"Starting Naver Blog Automation System on {Settings.WEB_HOST}:{Settings.WEB_PORT}")
-    web_logger.info(f"Debug mode: {Settings.WEB_DEBUG}")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    web_logger.info("Shutting down Naver Blog Automation System")
-
 if __name__ == "__main__":
     import uvicorn
 
@@ -161,6 +164,5 @@ if __name__ == "__main__":
         "src.web.app:app",
         host=Settings.WEB_HOST,
         port=Settings.WEB_PORT,
-        debug=Settings.WEB_DEBUG,
         reload=Settings.WEB_DEBUG
     )
