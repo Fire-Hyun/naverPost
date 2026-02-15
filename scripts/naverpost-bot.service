@@ -1,0 +1,52 @@
+# systemd service file for naverPost Telegram Bot
+# Installation: sudo cp naverpost-bot.service /etc/systemd/system/
+# Enable: sudo systemctl enable naverpost-bot
+# Start: sudo systemctl start naverpost-bot
+
+[Unit]
+Description=NaverPost Telegram Bot Service
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=mini
+Group=mini
+WorkingDirectory=/home/mini/dev/naverPost
+ExecStart=/usr/bin/python3 run_telegram_bot.py
+
+# Environment
+Environment=PYTHONPATH=/home/mini/dev/naverPost
+EnvironmentFile=-/home/mini/dev/naverPost/.env
+
+# Process management
+Restart=always
+RestartSec=10
+StartLimitInterval=300
+StartLimitBurst=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=naverpost-bot
+
+# Security
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/home/mini/dev/naverPost/data
+ReadWritePaths=/home/mini/dev/naverPost/uploads
+ReadWritePaths=/home/mini/dev/naverPost/memory
+PrivateTmp=yes
+
+# Resource limits
+MemoryMax=512M
+TasksMax=100
+
+# Graceful shutdown
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

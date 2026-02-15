@@ -3,7 +3,7 @@
 블로그 포스트 생성과 관련된 모든 데이터 구조를 정의합니다.
 """
 
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 from pydantic import BaseModel, Field, field_validator
 from pathlib import Path
@@ -219,6 +219,181 @@ class ProjectMetadata(BaseModel):
     @classmethod
     def validate_status(cls, v):
         allowed_statuses = ["draft", "validated", "posted", "failed"]
+        if v not in allowed_statuses:
+            raise ValueError(f"상태는 다음 중 하나여야 합니다: {', '.join(allowed_statuses)}")
+        return v
+
+
+# ============================================================
+# Phase 2: 새로운 데이터 모델들 (설계안 기준)
+# ============================================================
+
+class UserDirectInput(BaseModel):
+    """사용자 직접 입력 데이터 (위치, 해시태그 제거된 버전)"""
+    category: str = Field(..., description="카테고리 (맛집/제품/호텔/여행/뷰티/패션/IT/기타)")
+    rating: Optional[int] = Field(None, description="별점 (1-5)")
+    visit_date: Optional[str] = Field(None, description="방문/사용 날짜")
+    companion: Optional[str] = Field(None, description="동행자 (가족/친구/혼자/연인/동료)")
+    personal_review: str = Field(..., description="개인 감상평 (위치 추론 소스)")
+    ai_additional_script: Optional[str] = Field(None, description="AI 전달용 추가 스크립트")
+
+    @field_validator('category')
+    @classmethod
+    def validate_category(cls, v):
+        allowed_categories = ["맛집", "제품", "호텔", "여행", "뷰티", "패션", "IT", "기타"]
+        if v not in allowed_categories:
+            raise ValueError(f"카테고리는 다음 중 하나여야 합니다: {', '.join(allowed_categories)}")
+        return v
+
+    @field_validator('rating')
+    @classmethod
+    def validate_rating(cls, v):
+        if v is not None and (v < 1 or v > 5):
+            raise ValueError("별점은 1-5 사이의 값이어야 합니다")
+        return v
+
+    @field_validator('personal_review')
+    @classmethod
+    def validate_personal_review(cls, v):
+        if len(v.strip()) < 50:
+            raise ValueError("개인 감상평은 최소 50자 이상이어야 합니다")
+        if len(v) > 1000:
+            raise ValueError("개인 감상평은 1000자를 초과할 수 없습니다")
+        return v.strip()
+
+    @field_validator('companion')
+    @classmethod
+    def validate_companion(cls, v):
+        if v is not None:
+            allowed_companions = ["가족", "친구", "혼자", "연인", "동료"]
+            if v not in allowed_companions:
+                raise ValueError(f"동행자는 다음 중 하나여야 합니다: {', '.join(allowed_companions)}")
+        return v
+
+
+class LocationInfo(BaseModel):
+    """위치 정보 상세 구조"""
+    detected_location: Optional[str] = Field(None, description="추론된 위치명")
+    coordinates: Optional[Tuple[float, float]] = Field(None, description="GPS 좌표 (latitude, longitude)")
+    source: str = Field(..., description="추론 소스 (exif|text|none)")
+    confidence: float = Field(..., description="신뢰도 (0.0-1.0)")
+
+    @field_validator('source')
+    @classmethod
+    def validate_source(cls, v):
+        allowed_sources = ["exif", "text", "none"]
+        if v not in allowed_sources:
+            raise ValueError(f"추론 소스는 다음 중 하나여야 합니다: {', '.join(allowed_sources)}")
+        return v
+
+    @field_validator('confidence')
+    @classmethod
+    def validate_confidence(cls, v):
+        if v < 0.0 or v > 1.0:
+            raise ValueError("신뢰도는 0.0-1.0 사이의 값이어야 합니다")
+        return v
+
+
+class EXIFAnalysisResult(BaseModel):
+    """EXIF 분석 결과"""
+    gps_found: bool = Field(..., description="GPS 정보 발견 여부")
+    coordinates: Optional[Tuple[float, float]] = Field(None, description="GPS 좌표")
+    exif_confidence: float = Field(default=0.0, description="EXIF 기반 신뢰도")
+    extraction_method: Optional[str] = Field(None, description="추출 방법")
+    raw_exif_data: Dict[str, Any] = Field(default={}, description="원본 EXIF 데이터")
+
+
+class TextLocationAnalysis(BaseModel):
+    """텍스트 기반 위치 분석 결과"""
+    detected_location: Optional[str] = Field(None, description="텍스트에서 추출된 위치명")
+    extraction_method: str = Field(..., description="추출 방법 (pattern_matching|keyword_extraction)")
+    matched_patterns: List[str] = Field(default=[], description="매칭된 패턴들")
+    text_confidence: float = Field(..., description="텍스트 기반 신뢰도")
+    candidate_locations: List[str] = Field(default=[], description="후보 위치들")
+
+
+class HashtagCandidates(BaseModel):
+    """해시태그 후보 생성 결과"""
+    category_based: List[str] = Field(default=[], description="카테고리 기반 태그")
+    rating_based: List[str] = Field(default=[], description="별점 기반 태그")
+    companion_based: List[str] = Field(default=[], description="동행자 기반 태그")
+    keyword_based: List[str] = Field(default=[], description="키워드 기반 태그")
+    location_based: List[str] = Field(default=[], description="위치 기반 태그")
+
+
+class HashtagRefinementResult(BaseModel):
+    """해시태그 정제 결과"""
+    deduplicated: List[str] = Field(default=[], description="중복 제거된 태그")
+    semantic_filtered: List[str] = Field(default=[], description="의미 중복 제거된 태그")
+    final_tags: List[str] = Field(default=[], description="최종 선택된 태그 (5-7개)")
+
+
+class AIInferredData(BaseModel):
+    """AI 자동 추론/생성 데이터"""
+    location_analysis: Dict[str, Any] = Field(..., description="위치 분석 결과")
+    hashtag_analysis: Dict[str, Any] = Field(..., description="해시태그 분석 결과")
+    confidence_scores: Dict[str, float] = Field(..., description="신뢰도 점수들")
+    processing_metadata: Dict[str, Any] = Field(default={}, description="처리 메타데이터")
+
+
+class MetaJsonData(BaseModel):
+    """meta.json 파일 구조 (불변 원본)"""
+    project_id: str = Field(..., description="프로젝트 ID")
+    created_at: datetime = Field(default_factory=datetime.now, description="생성 시간")
+    user_input: UserDirectInput = Field(..., description="사용자 직접 입력")
+    images: List[str] = Field(..., description="이미지 파일명 목록")
+    settings: Dict[str, Any] = Field(default={}, description="생성 설정")
+
+    @field_validator('images')
+    @classmethod
+    def validate_images(cls, v):
+        if not v:
+            raise ValueError("최소 1개의 이미지가 필요합니다")
+        if len(v) > 10:
+            raise ValueError("이미지는 최대 10개까지 업로드 가능합니다")
+        return v
+
+
+class AnalysisJsonData(BaseModel):
+    """analysis.json 파일 구조 (AI 추론 결과, 재처리 가능)"""
+    project_id: str = Field(..., description="프로젝트 ID")
+    analysis_timestamp: datetime = Field(default_factory=datetime.now, description="분석 시간")
+    location_analysis: Dict[str, Any] = Field(..., description="위치 분석 상세 결과")
+    hashtag_analysis: Dict[str, Any] = Field(..., description="해시태그 분석 상세 결과")
+    confidence_scores: Dict[str, float] = Field(..., description="내부 전용 신뢰도 점수")
+    processing_metadata: Dict[str, str] = Field(default={}, description="처리 상태 메타데이터")
+
+
+class GenerationReadyData(BaseModel):
+    """generation_ready.json 파일 구조 (블로그 생성용 최종 데이터)"""
+    project_id: str = Field(..., description="프로젝트 ID")
+    generation_timestamp: datetime = Field(default_factory=datetime.now, description="생성 준비 시간")
+    merged_data: Dict[str, Any] = Field(..., description="통합된 최종 데이터")
+    generation_settings: Dict[str, Any] = Field(..., description="생성 설정")
+
+    @field_validator('merged_data')
+    @classmethod
+    def validate_merged_data(cls, v):
+        required_fields = ["category", "personal_review", "images"]
+        for field in required_fields:
+            if field not in v:
+                raise ValueError(f"merged_data에 필수 필드 '{field}'가 없습니다")
+        return v
+
+
+class PipelineLogEntry(BaseModel):
+    """파이프라인 로그 엔트리"""
+    timestamp: datetime = Field(default_factory=datetime.now, description="로그 시간")
+    stage: str = Field(..., description="처리 단계")
+    status: str = Field(..., description="상태 (completed|failed|warning)")
+    message: str = Field(..., description="로그 메시지")
+    confidence: Optional[float] = Field(None, description="신뢰도 (해당되는 경우)")
+    details: Dict[str, Any] = Field(default={}, description="추가 상세 정보")
+
+    @field_validator('status')
+    @classmethod
+    def validate_status(cls, v):
+        allowed_statuses = ["completed", "failed", "warning", "info"]
         if v not in allowed_statuses:
             raise ValueError(f"상태는 다음 중 하나여야 합니다: {', '.join(allowed_statuses)}")
         return v

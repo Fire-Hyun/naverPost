@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>네이버 지도 API 테스트</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        .header {
+            background: #03c75a;
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        .content {
+            padding: 30px;
+        }
+        .section {
+            margin-bottom: 40px;
+            padding: 20px;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+        }
+        .section h3 {
+            margin-top: 0;
+            color: #333;
+            border-bottom: 2px solid #03c75a;
+            padding-bottom: 10px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #555;
+        }
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .form-row {
+            display: flex;
+            gap: 15px;
+        }
+        .form-row .form-group {
+            flex: 1;
+        }
+        button {
+            background: #03c75a;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background 0.3s;
+        }
+        button:hover {
+            background: #02a847;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .result {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+            background: #f9f9f9;
+        }
+        .result.success {
+            border-color: #d4edda;
+            background: #d4edda;
+            color: #155724;
+        }
+        .result.error {
+            border-color: #f5c6cb;
+            background: #f8d7da;
+            color: #721c24;
+        }
+        .loading {
+            display: none;
+            color: #666;
+            font-style: italic;
+        }
+        .map-image {
+            max-width: 100%;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            margin-top: 15px;
+        }
+        .place-list {
+            margin-top: 15px;
+        }
+        .place-item {
+            padding: 10px;
+            border: 1px solid #e0e0e0;
+            margin-bottom: 10px;
+            border-radius: 4px;
+            background: white;
+        }
+        .place-item h4 {
+            margin: 0 0 5px 0;
+            color: #333;
+        }
+        .place-item p {
+            margin: 0;
+            color: #666;
+            font-size: 13px;
+        }
+        .coordinates {
+            font-family: monospace;
+            color: #007bff;
+        }
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        .status-healthy {
+            background: #28a745;
+        }
+        .status-unhealthy {
+            background: #dc3545;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🗺️ 네이버 지도 API 테스트</h1>
+            <p>네이버 지도 API의 다양한 기능을 테스트해보세요</p>
+        </div>
+
+        <div class="content">
+            <!-- API 상태 체크 -->
+            <div class="section">
+                <h3>🔍 API 상태 확인</h3>
+                <button onclick="checkApiHealth()">상태 확인</button>
+                <div class="loading" id="healthLoading">확인 중...</div>
+                <div id="healthResult" class="result" style="display: none;"></div>
+            </div>
+
+            <!-- 주소 -> 좌표 변환 -->
+            <div class="section">
+                <h3>📍 주소 → 좌표 변환 (Geocoding)</h3>
+                <div class="form-group">
+                    <label for="geocodeAddress">주소:</label>
+                    <input type="text" id="geocodeAddress" placeholder="예: 서울특별시 중구 세종대로 110"
+                           value="서울특별시 중구 세종대로 110">
+                </div>
+                <button onclick="geocodeAddress()">좌표 변환</button>
+                <div class="loading" id="geocodeLoading">변환 중...</div>
+                <div id="geocodeResult" class="result" style="display: none;"></div>
+            </div>
+
+            <!-- 좌표 -> 주소 변환 -->
+            <div class="section">
+                <h3>🎯 좌표 → 주소 변환 (Reverse Geocoding)</h3>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="reverseLat">위도:</label>
+                        <input type="number" id="reverseLat" step="0.000001" placeholder="37.566826" value="37.566826">
+                    </div>
+                    <div class="form-group">
+                        <label for="reverseLng">경도:</label>
+                        <input type="number" id="reverseLng" step="0.000001" placeholder="126.978656" value="126.978656">
+                    </div>
+                </div>
+                <button onclick="reverseGeocode()">주소 변환</button>
+                <div class="loading" id="reverseLoading">변환 중...</div>
+                <div id="reverseResult" class="result" style="display: none;"></div>
+            </div>
+
+            <!-- 지도 이미지 생성 -->
+            <div class="section">
+                <h3>🖼️ 정적 지도 이미지 생성</h3>
+                <div class="form-group">
+                    <label for="mapAddress">주소:</label>
+                    <input type="text" id="mapAddress" placeholder="예: 서울특별시 중구 세종대로 110"
+                           value="서울특별시 중구 세종대로 110">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="mapWidth">너비:</label>
+                        <input type="number" id="mapWidth" value="500" min="100" max="1024">
+                    </div>
+                    <div class="form-group">
+                        <label for="mapHeight">높이:</label>
+                        <input type="number" id="mapHeight" value="400" min="100" max="1024">
+                    </div>
+                    <div class="form-group">
+                        <label for="mapZoom">줌 레벨:</label>
+                        <select id="mapZoom">
+                            <option value="10">10 (넓은 지역)</option>
+                            <option value="13" selected>13 (보통)</option>
+                            <option value="15">15 (상세)</option>
+                            <option value="17">17 (매우 상세)</option>
+                        </select>
+                    </div>
+                </div>
+                <button onclick="generateMapImage()">지도 이미지 생성</button>
+                <div class="loading" id="mapLoading">생성 중...</div>
+                <div id="mapResult" class="result" style="display: none;"></div>
+            </div>
+
+            <!-- 장소 검색 -->
+            <div class="section">
+                <h3>🔎 장소 검색</h3>
+                <div class="form-group">
+                    <label for="searchQuery">검색어:</label>
+                    <input type="text" id="searchQuery" placeholder="예: 강남역 맛집" value="강남역 맛집">
+                </div>
+                <div class="form-group">
+                    <label for="searchCenter">중심 주소 (선택사항):</label>
+                    <input type="text" id="searchCenter" placeholder="예: 서울특별시 강남구 강남대로 396">
+                </div>
+                <div class="form-group">
+                    <label for="searchRadius">검색 반경 (미터):</label>
+                    <input type="number" id="searchRadius" value="5000" min="100" max="20000">
+                </div>
+                <button onclick="searchPlaces()">장소 검색</button>
+                <div class="loading" id="searchLoading">검색 중...</div>
+                <div id="searchResult" class="result" style="display: none;"></div>
+            </div>
+
+            <!-- 거리 계산 -->
+            <div class="section">
+                <h3>📏 거리 계산</h3>
+                <div class="form-group">
+                    <label for="fromAddress">출발지 주소:</label>
+                    <input type="text" id="fromAddress" placeholder="예: 서울특별시 중구 세종대로 110"
+                           value="서울특별시 중구 세종대로 110">
+                </div>
+                <div class="form-group">
+                    <label for="toAddress">도착지 주소:</label>
+                    <input type="text" id="toAddress" placeholder="예: 서울특별시 강남구 테헤란로 152"
+                           value="서울특별시 강남구 테헤란로 152">
+                </div>
+                <button onclick="calculateDistance()">거리 계산</button>
+                <div class="loading" id="distanceLoading">계산 중...</div>
+                <div id="distanceResult" class="result" style="display: none;"></div>
+            </div>
+
+            <!-- 전체 기능 테스트 -->
+            <div class="section">
+                <h3>🧪 전체 기능 테스트</h3>
+                <p>모든 네이버 지도 API 기능을 한 번에 테스트합니다.</p>
+                <button onclick="testAllFeatures()">전체 테스트 실행</button>
+                <div class="loading" id="testAllLoading">테스트 실행 중...</div>
+                <div id="testAllResult" class="result" style="display: none;"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // 공통 유틸리티 함수들
+        function showLoading(elementId) {
+            document.getElementById(elementId).style.display = 'block';
+        }
+
+        function hideLoading(elementId) {
+            document.getElementById(elementId).style.display = 'none';
+        }
+
+        function showResult(elementId, content, isError = false) {
+            const element = document.getElementById(elementId);
+            element.innerHTML = content;
+            element.className = `result ${isError ? 'error' : 'success'}`;
+            element.style.display = 'block';
+        }
+
+        function hideResult(elementId) {
+            document.getElementById(elementId).style.display = 'none';
+        }
+
+        // API 상태 확인
+        async function checkApiHealth() {
+            showLoading('healthLoading');
+            hideResult('healthResult');
+
+            try {
+                const response = await fetch('/api/map/health');
+                const data = await response.json();
+
+                let content = `<div>
+                    <span class="status-indicator ${data.api_valid ? 'status-healthy' : 'status-unhealthy'}"></span>
+                    <strong>상태:</strong> ${data.status}
+                </div>
+                <div><strong>메시지:</strong> ${data.message}</div>
+                <div><strong>API 유효성:</strong> ${data.api_valid ? '유효' : '무효'}</div>`;
+
+                showResult('healthResult', content, !data.api_valid);
+            } catch (error) {
+                showResult('healthResult', `오류: ${error.message}`, true);
+            }
+
+            hideLoading('healthLoading');
+        }
+
+        // 주소 -> 좌표 변환
+        async function geocodeAddress() {
+            const address = document.getElementById('geocodeAddress').value.trim();
+            if (!address) {
+                alert('주소를 입력하세요.');
+                return;
+            }
+
+            showLoading('geocodeLoading');
+            hideResult('geocodeResult');
+
+            try {
+                const response = await fetch(`/api/map/geocode?address=${encodeURIComponent(address)}`);
+                const data = await response.json();
+
+                if (response.ok) {
+                    const content = `
+                        <div><strong>주소:</strong> ${data.address}</div>
+                        <div><strong>좌표:</strong> <span class="coordinates">(${data.lat.toFixed(6)}, ${data.lng.toFixed(6)})</span></div>
+                        <div><strong>장소명:</strong> ${data.name}</div>
+                    `;
+                    showResult('geocodeResult', content);
+                } else {
+                    showResult('geocodeResult', `오류: ${data.detail}`, true);
+                }
+            } catch (error) {
+                showResult('geocodeResult', `오류: ${error.message}`, true);
+            }
+
+            hideLoading('geocodeLoading');
+        }
+
+        // 좌표 -> 주소 변환
+        async function reverseGeocode() {
+            const lat = document.getElementById('reverseLat').value;
+            const lng = document.getElementById('reverseLng').value;
+
+            if (!lat || !lng) {
+                alert('위도와 경도를 입력하세요.');
+                return;
+            }
+
+            showLoading('reverseLoading');
+            hideResult('reverseResult');
+
+            try {
+                const response = await fetch(`/api/map/reverse-geocode?lat=${lat}&lng=${lng}`);
+                const data = await response.json();
+
+                if (response.ok) {
+                    const content = `
+                        <div><strong>좌표:</strong> <span class="coordinates">(${data.lat.toFixed(6)}, ${data.lng.toFixed(6)})</span></div>
+                        <div><strong>주소:</strong> ${data.address}</div>
+                    `;
+                    showResult('reverseResult', content);
+                } else {
+                    showResult('reverseResult', `오류: ${data.detail}`, true);
+                }
+            } catch (error) {
+                showResult('reverseResult', `오류: ${error.message}`, true);
+            }
+
+            hideLoading('reverseLoading');
+        }
+
+        // 지도 이미지 생성
+        async function generateMapImage() {
+            const address = document.getElementById('mapAddress').value.trim();
+            const width = document.getElementById('mapWidth').value;
+            const height = document.getElementById('mapHeight').value;
+            const zoom = document.getElementById('mapZoom').value;
+
+            if (!address) {
+                alert('주소를 입력하세요.');
+                return;
+            }
+
+            showLoading('mapLoading');
+            hideResult('mapResult');
+
+            try {
+                const url = `/api/map/static-image?address=${encodeURIComponent(address)}&width=${width}&height=${height}&zoom=${zoom}`;
+                const response = await fetch(url);
+
+                if (response.ok) {
+                    const blob = await response.blob();
+                    const imageUrl = URL.createObjectURL(blob);
+
+                    const content = `
+                        <div><strong>주소:</strong> ${address}</div>
+                        <div><strong>이미지 크기:</strong> ${width} × ${height}px</div>
+                        <div><strong>줌 레벨:</strong> ${zoom}</div>
+                        <img src="${imageUrl}" alt="지도 이미지" class="map-image">
+                    `;
+                    showResult('mapResult', content);
+                } else {
+                    const data = await response.json();
+                    showResult('mapResult', `오류: ${data.detail}`, true);
+                }
+            } catch (error) {
+                showResult('mapResult', `오류: ${error.message}`, true);
+            }
+
+            hideLoading('mapLoading');
+        }
+
+        // 장소 검색
+        async function searchPlaces() {
+            const query = document.getElementById('searchQuery').value.trim();
+            const centerAddress = document.getElementById('searchCenter').value.trim();
+            const radius = document.getElementById('searchRadius').value;
+
+            if (!query) {
+                alert('검색어를 입력하세요.');
+                return;
+            }
+
+            showLoading('searchLoading');
+            hideResult('searchResult');
+
+            try {
+                let url = `/api/map/search-places?query=${encodeURIComponent(query)}&radius=${radius}`;
+                if (centerAddress) {
+                    url += `&center_address=${encodeURIComponent(centerAddress)}`;
+                }
+
+                const response = await fetch(url);
+                const data = await response.json();
+
+                if (response.ok) {
+                    let content = `<div><strong>검색 결과:</strong> ${data.length}개</div>`;
+
+                    if (data.length > 0) {
+                        content += '<div class="place-list">';
+                        data.forEach((place, index) => {
+                            content += `
+                                <div class="place-item">
+                                    <h4>${index + 1}. ${place.name}</h4>
+                                    <p><strong>주소:</strong> ${place.address}</p>
+                                    <p><strong>좌표:</strong> <span class="coordinates">(${place.lat.toFixed(6)}, ${place.lng.toFixed(6)})</span></p>
+                                </div>
+                            `;
+                        });
+                        content += '</div>';
+                    }
+
+                    showResult('searchResult', content);
+                } else {
+                    showResult('searchResult', `오류: ${data.detail}`, true);
+                }
+            } catch (error) {
+                showResult('searchResult', `오류: ${error.message}`, true);
+            }
+
+            hideLoading('searchLoading');
+        }
+
+        // 거리 계산
+        async function calculateDistance() {
+            const fromAddress = document.getElementById('fromAddress').value.trim();
+            const toAddress = document.getElementById('toAddress').value.trim();
+
+            if (!fromAddress || !toAddress) {
+                alert('출발지와 도착지 주소를 모두 입력하세요.');
+                return;
+            }
+
+            showLoading('distanceLoading');
+            hideResult('distanceResult');
+
+            try {
+                const url = `/api/map/distance?from_address=${encodeURIComponent(fromAddress)}&to_address=${encodeURIComponent(toAddress)}`;
+                const response = await fetch(url);
+                const data = await response.json();
+
+                if (response.ok) {
+                    const content = `
+                        <div><strong>출발지:</strong> ${data.from.address}</div>
+                        <div><strong>출발지 좌표:</strong> <span class="coordinates">(${data.from.lat.toFixed(6)}, ${data.from.lng.toFixed(6)})</span></div>
+                        <div><strong>도착지:</strong> ${data.to.address}</div>
+                        <div><strong>도착지 좌표:</strong> <span class="coordinates">(${data.to.lat.toFixed(6)}, ${data.to.lng.toFixed(6)})</span></div>
+                        <div style="margin-top: 15px; padding: 10px; background: #e3f2fd; border-radius: 4px;">
+                            <div><strong>직선거리:</strong> ${data.distance_meters.toLocaleString()}m (${data.distance_km}km)</div>
+                        </div>
+                    `;
+                    showResult('distanceResult', content);
+                } else {
+                    showResult('distanceResult', `오류: ${data.detail}`, true);
+                }
+            } catch (error) {
+                showResult('distanceResult', `오류: ${error.message}`, true);
+            }
+
+            hideLoading('distanceLoading');
+        }
+
+        // 전체 기능 테스트
+        async function testAllFeatures() {
+            showLoading('testAllLoading');
+            hideResult('testAllResult');
+
+            try {
+                const response = await fetch('/api/map/test/all');
+                const data = await response.json();
+
+                if (response.ok) {
+                    const results = data.test_results;
+                    let content = `<div><strong>테스트 상태:</strong> ${data.status}</div><hr>`;
+
+                    // API 검증
+                    content += `<div><strong>API 키 검증:</strong> ${results.api_validation ? '✅ 성공' : '❌ 실패'}</div>`;
+
+                    // Geocoding
+                    if (results.geocoding) {
+                        content += `<div><strong>Geocoding:</strong> ${results.geocoding.success ? '✅ 성공' : '❌ 실패'}</div>`;
+                        if (results.geocoding.location) {
+                            const loc = results.geocoding.location;
+                            content += `<div style="margin-left: 20px; font-size: 12px;">좌표: (${loc.lat.toFixed(6)}, ${loc.lng.toFixed(6)})</div>`;
+                        }
+                    }
+
+                    // Reverse Geocoding
+                    if (results.reverse_geocoding) {
+                        content += `<div><strong>Reverse Geocoding:</strong> ${results.reverse_geocoding.success ? '✅ 성공' : '❌ 실패'}</div>`;
+                        if (results.reverse_geocoding.address) {
+                            content += `<div style="margin-left: 20px; font-size: 12px;">주소: ${results.reverse_geocoding.address}</div>`;
+                        }
+                    }
+
+                    // 장소 검색
+                    if (results.place_search) {
+                        content += `<div><strong>장소 검색:</strong> ${results.place_search.success ? '✅ 성공' : '❌ 실패'}</div>`;
+                        if (results.place_search.count) {
+                            content += `<div style="margin-left: 20px; font-size: 12px;">검색된 장소: ${results.place_search.count}개</div>`;
+                        }
+                        if (results.place_search.sample) {
+                            const sample = results.place_search.sample;
+                            content += `<div style="margin-left: 20px; font-size: 12px;">샘플: ${sample.name} - ${sample.address}</div>`;
+                        }
+                    }
+
+                    showResult('testAllResult', content);
+                } else {
+                    showResult('testAllResult', `오류: ${data.detail}`, true);
+                }
+            } catch (error) {
+                showResult('testAllResult', `오류: ${error.message}`, true);
+            }
+
+            hideLoading('testAllLoading');
+        }
+
+        // 페이지 로드 시 API 상태 확인
+        window.onload = function() {
+            checkApiHealth();
+        };
+    </script>
+</body>
+</html>

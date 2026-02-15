@@ -98,8 +98,14 @@
                         <i class="fas fa-cloud-upload-alt fa-3x text-primary mb-3"></i>
                         <h5>이미지를 드래그하거나 클릭하여 업로드</h5>
                         <p class="text-muted">최대 10개, 각 파일당 최대 50MB</p>
-                        <input type="file" id="imageInput" multiple accept="image/*" class="d-none">
-                        <button type="button" class="btn btn-primary mt-3" onclick="document.getElementById('imageInput').click()">
+                        <!--
+                          NOTE:
+                          - d-none(display:none)은 일부 브라우저에서 file input의 programmatic click을 막아
+                            "파일 선택 창이 아예 안 뜨는" 현상을 유발할 수 있습니다.
+                          - visually-hidden은 display:none이 아니어서 안정적으로 동작합니다.
+                        -->
+                        <input type="file" id="imageInput" multiple accept="image/*" class="visually-hidden">
+                        <button type="button" class="btn btn-primary mt-3" id="imageSelectBtn">
                             <i class="fas fa-plus me-2"></i>이미지 선택
                         </button>
                     </div>
@@ -195,6 +201,7 @@
                                 블로그 포스트 생성하기
                             </button>
                         </div>
+                        <div class="status-message" id="formStatus"></div>
                     </form>
                 </div>
 
@@ -212,69 +219,138 @@
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        let uploadedImages = [];
+        document.addEventListener('DOMContentLoaded', function () {
+            let uploadedImages = [];
+            let currentSession = null;
 
-        // 파일 업로드 관련 이벤트
-        const uploadArea = document.getElementById('uploadArea');
-        const imageInput = document.getElementById('imageInput');
-        const imagePreview = document.getElementById('imagePreview');
-        const uploadStatus = document.getElementById('uploadStatus');
+            // 파일 업로드 관련 엘리먼트
+            const uploadArea = document.getElementById('uploadArea');
+            const imageInput = document.getElementById('imageInput');
+            const imageSelectBtn = document.getElementById('imageSelectBtn');
+            const imagePreview = document.getElementById('imagePreview');
+            const uploadStatus = document.getElementById('uploadStatus');
+            const formStatus = document.getElementById('formStatus');
+            const experienceForm = document.getElementById('experienceForm');
 
-        uploadArea.addEventListener('click', () => imageInput.click());
-        uploadArea.addEventListener('dragover', handleDragOver);
-        uploadArea.addEventListener('dragleave', handleDragLeave);
-        uploadArea.addEventListener('drop', handleDrop);
-        imageInput.addEventListener('change', handleFileSelect);
+            if (!uploadArea || !imageInput || !imageSelectBtn || !imagePreview || !uploadStatus || !experienceForm) {
+                console.error('[init] element missing', {
+                    uploadArea: !!uploadArea,
+                    imageInput: !!imageInput,
+                    imageSelectBtn: !!imageSelectBtn,
+                    imagePreview: !!imagePreview,
+                    uploadStatus: !!uploadStatus,
+                    formStatus: !!formStatus,
+                    experienceForm: !!experienceForm,
+                });
+                return;
+            }
 
-        function handleDragOver(e) {
-            e.preventDefault();
-            uploadArea.classList.add('dragover');
-        }
+            console.log('[init] upload bindings initialized');
 
-        function handleDragLeave(e) {
-            e.preventDefault();
-            uploadArea.classList.remove('dragover');
-        }
+            // --- 업로드 UI 이벤트 바인딩 ---
+            uploadArea.addEventListener('click', (e) => {
+                // 버튼 클릭은 별도 핸들러가 처리
+                if (e.target && e.target.closest && e.target.closest('#imageSelectBtn')) return;
+                e.preventDefault();
+                // 같은 파일 재선택 시 change가 항상 뜨도록
+                imageInput.value = '';
+                imageInput.click();
+            });
 
-        function handleDrop(e) {
-            e.preventDefault();
-            uploadArea.classList.remove('dragover');
-            const files = Array.from(e.dataTransfer.files);
-            uploadFiles(files);
-        }
+            imageSelectBtn.addEventListener('click', (e) => {
+                // 버블링으로 uploadArea click이 중복 실행되는 것 방지
+                e.preventDefault();
+                e.stopPropagation();
+                imageInput.value = '';
+                console.log('[ui] imageSelectBtn clicked');
+                // 일부 브라우저는 display:none input의 click을 막습니다.
+                // showPicker()를 지원하면 우선 사용하고, 아니면 click() 폴백.
+                if (typeof imageInput.showPicker === 'function') {
+                    imageInput.showPicker();
+                } else {
+                    imageInput.click();
+                }
+            });
 
-        function handleFileSelect(e) {
-            const files = Array.from(e.target.files);
-            uploadFiles(files);
-        }
+            uploadArea.addEventListener('dragover', handleDragOver);
+            uploadArea.addEventListener('dragleave', handleDragLeave);
+            uploadArea.addEventListener('drop', handleDrop);
+            imageInput.addEventListener('change', handleFileSelect);
 
-        async function uploadFiles(files) {
-            const formData = new FormData();
-            files.forEach(file => formData.append('files', file));
+            function handleDragOver(e) {
+                e.preventDefault();
+                uploadArea.classList.add('dragover');
+            }
 
-            try {
-                showStatus('이미지 업로드 중...', 'info');
+            function handleDragLeave(e) {
+                e.preventDefault();
+                uploadArea.classList.remove('dragover');
+            }
 
-                const response = await fetch('/api/upload/images', {
-                    method: 'POST',
-                    body: formData
+            function handleDrop(e) {
+                e.preventDefault();
+                uploadArea.classList.remove('dragover');
+                const files = Array.from(e.dataTransfer.files || []);
+                uploadFiles(files);
+            }
+
+            function handleFileSelect(e) {
+                const files = Array.from((e.target && e.target.files) ? e.target.files : []);
+                uploadFiles(files);
+            }
+
+            async function uploadFiles(files) {
+                if (!files || files.length === 0) return;
+
+                // 매 요청마다 새 FormData 생성
+                const formData = new FormData();
+                for (let i = 0; i < files.length; i++) {
+                    formData.append('files', files[i]);
+                }
+
+                // 첫 실행 여부/요청 생성 여부를 확인하기 위한 로그
+                console.log('Upload triggered', {
+                    count: files.length,
+                    names: files.map(f => f.name),
+                    currentSession
                 });
 
-                const result = await response.json();
+                try {
+                    showStatus('이미지 업로드 중...', 'info');
 
-                if (result.success) {
-                    uploadedImages.push(...result.uploaded_files);
-                    updateImagePreview();
-                    showStatus(result.message, 'success');
-                } else {
-                    showStatus('업로드 실패: ' + result.message, 'error');
+                    // 첫 업로드는 레거시 엔드포인트로 "세션 생성 + 업로드"를 처리하고,
+                    // 이후 추가 업로드는 동일 세션에 붙입니다.
+                    const uploadUrl = currentSession
+                        ? `/api/sessions/${currentSession}/images`
+                        : '/api/upload/images';
+
+                    const response = await fetch(uploadUrl, {
+                        method: 'POST',
+                        body: formData
+                    });
+
+                    const result = await response.json();
+
+                    if (result.success) {
+                        if (result.date_directory) {
+                            currentSession = result.date_directory;
+                        }
+
+                        uploadedImages.push(...(result.uploaded_files || []));
+                        updateImagePreview();
+                        showStatus(result.message, 'success');
+                    } else {
+                        showStatus('업로드 실패: ' + (result.message || 'Unknown error'), 'error');
+                    }
+                } catch (error) {
+                    showStatus('업로드 중 오류가 발생했습니다: ' + error.message, 'error');
+                } finally {
+                    // 같은 파일을 다시 선택해도 change 이벤트가 항상 동작하도록 초기화
+                    imageInput.value = '';
                 }
-            } catch (error) {
-                showStatus('업로드 중 오류가 발생했습니다: ' + error.message, 'error');
             }
-        }
 
-        function updateImagePreview() {
+            function updateImagePreview() {
             imagePreview.innerHTML = '';
             uploadedImages.forEach((image, index) => {
                 const imageItem = document.createElement('div');
@@ -287,73 +363,120 @@
                 `;
                 imagePreview.appendChild(imageItem);
             });
-        }
+            }
 
-        function removeImage(index) {
+            window.removeImage = function removeImage(index) {
             uploadedImages.splice(index, 1);
             updateImagePreview();
-        }
+            }
 
-        function showStatus(message, type) {
+            function showStatus(message, type) {
             const alertClass = type === 'success' ? 'alert-success' :
                              type === 'error' ? 'alert-danger' : 'alert-info';
 
-            uploadStatus.innerHTML = `
+            const html = `
                 <div class="alert ${alertClass} alert-dismissible fade show" role="alert">
                     ${message}
                     <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
                 </div>
             `;
-        }
+            uploadStatus.innerHTML = html;
+            if (formStatus) formStatus.innerHTML = html;
+            }
 
-        // 폼 제출 처리
-        document.getElementById('experienceForm').addEventListener('submit', async function(e) {
+            // 폼 제출 처리
+            experienceForm.addEventListener('submit', async function(e) {
             e.preventDefault();
+
+            console.log('Generate triggered', {
+                currentSession,
+                uploadedImagesLen: uploadedImages.length
+            });
+
+            // 브라우저 기본 유효성 검사에서 막히는 경우(사용자는 "아무 반응 없음"으로 느낄 수 있음)
+            if (!experienceForm.checkValidity()) {
+                experienceForm.reportValidity();
+                showStatus('필수 입력값을 먼저 채워주세요. (카테고리/개인 감상평)', 'error');
+                return;
+            }
 
             if (uploadedImages.length === 0) {
                 showStatus('최소 1개의 이미지를 업로드해주세요.', 'error');
                 return;
             }
 
-            const formData = new FormData();
-            formData.append('images', JSON.stringify(uploadedImages.map(img => img.saved_path)));
-            formData.append('category', document.getElementById('category').value);
-            formData.append('personal_review', document.getElementById('personalReview').value);
-            formData.append('additional_notes', document.getElementById('additionalNotes').value);
-            formData.append('location', document.getElementById('location').value);
-            formData.append('hashtags', JSON.stringify(
-                document.getElementById('hashtags').value
-                    .split(',')
-                    .map(tag => tag.trim())
-                    .filter(tag => tag.length > 0)
-            ));
-            formData.append('rating', document.getElementById('rating').value);
-            formData.append('visit_date', document.getElementById('visitDate').value);
-            formData.append('companion', document.getElementById('companion').value);
+            if (!currentSession) {
+                showStatus('세션이 아직 생성되지 않았습니다. 이미지를 먼저 업로드해주세요.', 'error');
+                return;
+            }
+
+            // 사용자 경험 데이터 구성 (세션 업데이트용)
+            const hashtagsList = document.getElementById('hashtags').value
+                .split(',')
+                .map(tag => tag.trim())
+                .filter(tag => tag.length > 0);
+
+            const experiencePayload = {
+                category: document.getElementById('category').value,
+                personal_review: document.getElementById('personalReview').value,
+                rating: document.getElementById('rating').value ? Number(document.getElementById('rating').value) : null,
+                visit_date: document.getElementById('visitDate').value || null,
+                companion: document.getElementById('companion').value || null,
+                ai_additional_script: document.getElementById('additionalNotes').value || null,
+                hashtags: hashtagsList.join(',')
+            };
 
             try {
-                showStatus('사용자 경험 데이터를 처리 중...', 'info');
+                showStatus('세션 정보를 저장 중...', 'info');
 
-                const response = await fetch('/api/user-experience', {
-                    method: 'POST',
-                    body: formData
+                // 1) 세션 메타데이터 업데이트
+                const updateResp = await fetch(`/api/sessions/${currentSession}/experience`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(experiencePayload)
                 });
 
-                const result = await response.json();
+                const updateResult = await updateResp.json();
 
-                if (result.success) {
-                    showStatus('사용자 경험 데이터가 성공적으로 생성되었습니다!', 'success');
-                    // TODO: 다음 단계 (블로그 포스트 생성) 구현
-                } else {
-                    showStatus('처리 실패: ' + result.message, 'error');
+                if (!updateResult.success) {
+                    showStatus('세션 업데이트 실패', 'error');
+                    return;
                 }
+
+                // 2) 블로그 포스트 생성
+                showStatus('블로그 포스트 생성 중...', 'info');
+                const genResp = await fetch(`/api/sessions/${currentSession}/generate-blog`, {
+                    method: 'POST'
+                });
+                const genResult = await genResp.json();
+
+                if (!genResult.success) {
+                    showStatus('생성 실패: ' + (genResult.detail || 'Unknown error'), 'error');
+                    return;
+                }
+
+                showStatus('블로그 포스트 생성 완료!', 'success');
+
+                const resultSection = document.getElementById('resultSection');
+                const generatedContent = document.getElementById('generatedContent');
+                resultSection.classList.remove('d-none');
+
+                const content = genResult.generated_content || '';
+                generatedContent.innerHTML = `
+                    <div class="alert alert-secondary">
+                        <div class="mb-2"><strong>세션:</strong> ${genResult.date_directory}</div>
+                        <div class="mb-2"><strong>저장 경로:</strong> ${genResult.blog_file_path || '-'}</div>
+                    </div>
+                    <pre style="white-space: pre-wrap; background:#fff; padding:16px; border:1px solid #dee2e6; border-radius:8px;">${content.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>
+                `;
+
             } catch (error) {
                 showStatus('처리 중 오류가 발생했습니다: ' + error.message, 'error');
             }
-        });
+            });
 
-        // 페이지 로드 시 설정 정보 조회
-        async function loadSettings() {
+            // 페이지 로드 시 설정 정보 조회
+            async function loadSettings() {
             try {
                 const response = await fetch('/api/uploads/status');
                 const settings = await response.json();
@@ -364,10 +487,10 @@
             } catch (error) {
                 console.error('설정 정보 로드 실패:', error);
             }
-        }
+            }
 
-        // 페이지 로드 완료 시 실행
-        document.addEventListener('DOMContentLoaded', loadSettings);
+            loadSettings();
+        });
     </script>
 </body>
 </html>
