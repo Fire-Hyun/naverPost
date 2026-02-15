@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>블로그 자동화 워크플로우 - 네이버 블로그 포스팅 시스템</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+
+        .container {
+            background: white;
+            border-radius: 10px;
+            padding: 30px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #555;
+        }
+
+        input, select, textarea {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+
+        textarea {
+            height: 120px;
+            resize: vertical;
+        }
+
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-right: 10px;
+        }
+
+        button:hover {
+            background: #0056b3;
+        }
+
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+
+        .progress-container {
+            margin-top: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 5px;
+            display: none;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 20px;
+            background: #e9ecef;
+            border-radius: 10px;
+            overflow: hidden;
+            margin-bottom: 10px;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: #28a745;
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+
+        .status-message {
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+
+        .step-info {
+            color: #666;
+            font-size: 14px;
+        }
+
+        .result-container {
+            margin-top: 20px;
+            padding: 20px;
+            border-radius: 5px;
+            display: none;
+        }
+
+        .result-success {
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+        }
+
+        .result-error {
+            background: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .checkbox-group input[type="checkbox"] {
+            width: auto;
+        }
+
+        .quality-scores {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+            margin: 15px 0;
+        }
+
+        .quality-item {
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 5px;
+        }
+
+        .quality-item strong {
+            display: block;
+            margin-bottom: 5px;
+            color: #333;
+        }
+
+        .quality-score {
+            font-size: 18px;
+            font-weight: bold;
+        }
+
+        .score-excellent { color: #28a745; }
+        .score-good { color: #17a2b8; }
+        .score-fair { color: #ffc107; }
+        .score-poor { color: #dc3545; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🤖 블로그 자동화 워크플로우</h1>
+        <p style="text-align: center; color: #666;">
+            데이터 검증 → AI 블로그 생성 → 품질 검증 → 네이버 임시저장까지 완전 자동화
+        </p>
+
+        <form id="workflowForm">
+            <div class="form-group">
+                <label for="visitDate">방문 날짜*</label>
+                <input type="date" id="visitDate" name="visitDate" required>
+            </div>
+
+            <div class="form-group">
+                <label for="category">카테고리*</label>
+                <select id="category" name="category" required>
+                    <option value="">카테고리를 선택하세요</option>
+                    <option value="맛집">맛집</option>
+                    <option value="제품">제품</option>
+                    <option value="호텔">호텔</option>
+                    <option value="여행">여행</option>
+                    <option value="뷰티">뷰티</option>
+                    <option value="패션">패션</option>
+                    <option value="IT">IT</option>
+                    <option value="기타">기타</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label for="storeName">상호명*</label>
+                <input type="text" id="storeName" name="storeName" placeholder="예: 스타벅스 강남역점" required>
+                <small style="color: #666;">지점명을 모르면 브랜드명만 입력해도 됩니다.</small>
+            </div>
+
+            <div class="form-group">
+                <label for="personalReview">개인 감상평* (최소 50자)</label>
+                <textarea id="personalReview" name="personalReview" placeholder="방문하신 경험과 느낌을 자세히 작성해주세요..." required></textarea>
+                <small style="color: #666;">현재 <span id="reviewLength">0</span>자</small>
+            </div>
+
+            <div class="form-group">
+                <label for="rating">별점</label>
+                <select id="rating" name="rating">
+                    <option value="">별점 선택 (선택사항)</option>
+                    <option value="5">⭐⭐⭐⭐⭐ (5점)</option>
+                    <option value="4">⭐⭐⭐⭐ (4점)</option>
+                    <option value="3">⭐⭐⭐ (3점)</option>
+                    <option value="2">⭐⭐ (2점)</option>
+                    <option value="1">⭐ (1점)</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label for="companion">동행자</label>
+                <select id="companion" name="companion">
+                    <option value="">동행자 선택 (선택사항)</option>
+                    <option value="혼자">혼자</option>
+                    <option value="가족">가족</option>
+                    <option value="친구">친구</option>
+                    <option value="연인">연인</option>
+                    <option value="동료">동료</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label for="location">위치</label>
+                <input type="text" id="location" name="location" placeholder="예: 서울시 강남구 (선택사항)">
+            </div>
+
+            <div class="form-group">
+                <label for="additionalScript">추가 스크립트</label>
+                <textarea id="additionalScript" name="additionalScript" placeholder="블로그 작성 시 참고할 추가 내용이 있으면 입력하세요..."></textarea>
+            </div>
+
+            <div class="form-group">
+                <div class="checkbox-group">
+                    <input type="checkbox" id="autoUpload" name="autoUpload" checked>
+                    <label for="autoUpload">네이버 블로그 자동 임시저장</label>
+                </div>
+            </div>
+
+            <div style="text-align: center;">
+                <button type="submit" id="startBtn">🚀 자동화 시작</button>
+                <button type="button" id="cancelBtn" disabled>⏹️ 취소</button>
+            </div>
+        </form>
+
+        <div id="progressContainer" class="progress-container">
+            <div class="status-message" id="statusMessage">준비 중...</div>
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressFill"></div>
+            </div>
+            <div class="step-info" id="stepInfo">0/0 단계</div>
+        </div>
+
+        <div id="resultContainer" class="result-container">
+            <div id="resultContent"></div>
+        </div>
+    </div>
+
+    <script>
+        let currentWorkflowId = null;
+        let progressInterval = null;
+
+        // 감상평 글자수 카운터
+        document.getElementById('personalReview').addEventListener('input', function() {
+            const length = this.value.length;
+            document.getElementById('reviewLength').textContent = length;
+
+            if (length < 50) {
+                this.style.borderColor = '#dc3545';
+            } else {
+                this.style.borderColor = '#28a745';
+            }
+        });
+
+        // 오늘 날짜를 기본값으로 설정
+        document.getElementById('visitDate').value = new Date().toISOString().split('T')[0];
+
+        // 폼 제출 처리
+        document.getElementById('workflowForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+
+            const formData = new FormData(this);
+            const data = {
+                visit_date: formData.get('visitDate').replace(/-/g, ''),
+                category: formData.get('category'),
+                store_name: formData.get('storeName'),
+                personal_review: formData.get('personalReview'),
+                rating: formData.get('rating') ? parseInt(formData.get('rating')) : null,
+                companion: formData.get('companion') || null,
+                location: formData.get('location') || null,
+                additional_script: formData.get('additionalScript') || '',
+                auto_upload_to_naver: formData.has('autoUpload')
+            };
+
+            try {
+                await startWorkflow(data);
+            } catch (error) {
+                showError('워크플로우 시작 실패: ' + error.message);
+            }
+        });
+
+        // 취소 버튼 처리
+        document.getElementById('cancelBtn').addEventListener('click', async function() {
+            if (currentWorkflowId) {
+                try {
+                    await cancelWorkflow(currentWorkflowId);
+                } catch (error) {
+                    console.error('취소 실패:', error);
+                }
+            }
+        });
+
+        async function startWorkflow(data) {
+            showProgress();
+
+            const response = await fetch('/api/workflow/start', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(data)
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+
+            const result = await response.json();
+
+            if (result.success) {
+                currentWorkflowId = result.workflow_id;
+                document.getElementById('startBtn').disabled = true;
+                document.getElementById('cancelBtn').disabled = false;
+
+                // 진행상황 모니터링 시작
+                startProgressMonitoring(currentWorkflowId);
+            } else {
+                throw new Error(result.message || '알 수 없는 오류');
+            }
+        }
+
+        async function cancelWorkflow(workflowId) {
+            const response = await fetch(`/api/workflow/cancel/${workflowId}`, {
+                method: 'POST'
+            });
+
+            if (response.ok) {
+                stopProgressMonitoring();
+                showError('사용자에 의해 취소되었습니다.');
+                resetForm();
+            }
+        }
+
+        function startProgressMonitoring(workflowId) {
+            progressInterval = setInterval(async () => {
+                try {
+                    const response = await fetch(`/api/workflow/status/${workflowId}`);
+                    if (!response.ok) return;
+
+                    const status = await response.json();
+                    updateProgress(status);
+
+                    // 완료/실패/취소 시 모니터링 중단
+                    if (['completed', 'failed', 'cancelled'].includes(status.status)) {
+                        stopProgressMonitoring();
+                        handleWorkflowCompletion(status);
+                    }
+                } catch (error) {
+                    console.error('상태 확인 실패:', error);
+                }
+            }, 1000);
+        }
+
+        function stopProgressMonitoring() {
+            if (progressInterval) {
+                clearInterval(progressInterval);
+                progressInterval = null;
+            }
+        }
+
+        function updateProgress(status) {
+            document.getElementById('statusMessage').textContent = status.message;
+            document.getElementById('progressFill').style.width = status.progress_percentage + '%';
+            document.getElementById('stepInfo').textContent = `${status.current_step}/${status.total_steps} 단계: ${status.step_name}`;
+        }
+
+        function handleWorkflowCompletion(status) {
+            if (status.status === 'completed') {
+                showSuccess(status.results);
+            } else if (status.status === 'failed') {
+                showError(status.message);
+            } else if (status.status === 'cancelled') {
+                showError('워크플로우가 취소되었습니다.');
+            }
+            resetForm();
+        }
+
+        function showProgress() {
+            document.getElementById('progressContainer').style.display = 'block';
+            document.getElementById('resultContainer').style.display = 'none';
+        }
+
+        function showSuccess(results) {
+            const container = document.getElementById('resultContainer');
+            const content = document.getElementById('resultContent');
+
+            let html = '<h3>🎉 자동화 완료!</h3>';
+
+            if (results.generation) {
+                html += `<p><strong>📝 생성된 블로그:</strong> ${results.generation.length || '알 수 없음'}자</p>`;
+            }
+
+            if (results.quality) {
+                html += '<div class="quality-scores">';
+                html += `<div class="quality-item">`;
+                html += `<strong>전체 품질 점수</strong>`;
+                html += `<div class="quality-score ${getScoreClass(results.quality.overall_score)}">${(results.quality.overall_score * 100).toFixed(0)}점</div>`;
+                html += `</div>`;
+
+                const detailed = results.quality.detailed_scores || {};
+                Object.entries(detailed).forEach(([key, value]) => {
+                    const name = {
+                        'naver_compliance': '네이버 정책 준수',
+                        'keyword_quality': '키워드 품질',
+                        'personal_authenticity': '개인 경험 진정성',
+                        'technical_quality': '기술적 품질'
+                    }[key] || key;
+
+                    html += `<div class="quality-item">`;
+                    html += `<strong>${name}</strong>`;
+                    html += `<div class="quality-score ${getScoreClass(value)}">${(value * 100).toFixed(0)}점</div>`;
+                    html += `</div>`;
+                });
+                html += '</div>';
+            }
+
+            if (results.upload && results.upload.success) {
+                html += '<p><strong>📤 네이버 업로드:</strong> ✅ 임시저장 완료</p>';
+            } else if (results.upload) {
+                html += `<p><strong>⚠️ 네이버 업로드:</strong> 실패 - ${results.upload.error}</p>`;
+            }
+
+            content.innerHTML = html;
+            container.className = 'result-container result-success';
+            container.style.display = 'block';
+        }
+
+        function showError(message) {
+            const container = document.getElementById('resultContainer');
+            const content = document.getElementById('resultContent');
+
+            content.innerHTML = `<h3>❌ 오류 발생</h3><p>${message}</p>`;
+            container.className = 'result-container result-error';
+            container.style.display = 'block';
+        }
+
+        function getScoreClass(score) {
+            if (score >= 0.9) return 'score-excellent';
+            if (score >= 0.8) return 'score-good';
+            if (score >= 0.7) return 'score-fair';
+            return 'score-poor';
+        }
+
+        function resetForm() {
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('cancelBtn').disabled = true;
+            currentWorkflowId = null;
+        }
+    </script>
+</body>
+</html>

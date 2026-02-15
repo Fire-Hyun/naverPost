@@ -3,11 +3,15 @@
 기본 프로젝트 구조 및 모듈 임포트 테스트
 """
 
+import os
 import sys
 from pathlib import Path
 
-# 프로젝트 루트를 파이썬 경로에 추가
-sys.path.insert(0, str(Path(__file__).parent))
+# 프로젝트 루트를 파이썬 경로에 추가 (scripts/ 아래로 이동했기 때문)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+os.chdir(PROJECT_ROOT)
+
 
 def test_project_structure():
     """프로젝트 구조 테스트"""
@@ -27,7 +31,7 @@ def test_project_structure():
         "data",
         "uploads",
         "templates",
-        "tests"
+        "tests",
     ]
 
     for dir_path in required_dirs:
@@ -36,6 +40,7 @@ def test_project_structure():
         print(f"{status} {dir_path}")
 
     print()
+
 
 def test_file_structure():
     """핵심 파일 존재 확인"""
@@ -53,7 +58,7 @@ def test_file_structure():
         "src/web/static/index.html",
         "requirements.txt",
         ".env.example",
-        "README.md"
+        "README.md",
     ]
 
     for file_path in required_files:
@@ -63,6 +68,7 @@ def test_file_structure():
         print(f"{status} {file_path} {size}")
 
     print()
+
 
 def test_basic_imports():
     """기본 모듈 임포트 테스트"""
@@ -79,7 +85,7 @@ def test_basic_imports():
     for module_name, class_name in import_tests:
         try:
             module = __import__(module_name, fromlist=[class_name])
-            cls = getattr(module, class_name)
+            getattr(module, class_name)
             print(f"✅ {module_name}.{class_name}")
         except ImportError as e:
             print(f"❌ {module_name}.{class_name} - ImportError: {e}")
@@ -89,6 +95,7 @@ def test_basic_imports():
             print(f"❌ {module_name}.{class_name} - Error: {e}")
 
     print()
+
 
 def test_environment_setup():
     """환경 설정 테스트"""
@@ -111,6 +118,7 @@ def test_environment_setup():
 
     print()
 
+
 def main():
     """메인 테스트 실행"""
     print("🚀 네이버 블로그 포스팅 자동화 시스템 구조 테스트")
@@ -130,5 +138,7 @@ def main():
     print("3. .env 파일 편집 (API 키 및 계정 정보 입력)")
     print("4. python -m src.web.app (웹 서버 실행)")
 
+
 if __name__ == "__main__":
     main()
+
