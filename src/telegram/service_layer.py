@@ -137,7 +137,15 @@ class BlogGenerationService:
                 # 네이버 업로드 로깅
                 upload_data = results.get('upload', {})
                 if upload_data:
-                    if upload_data.get('success'):
+                    if upload_data.get('success') and upload_data.get('draft_saved', False):
+                        if upload_data.get('image_included_success'):
+                            user_logger.log_naver_upload_success(upload_data.get('post_url'))
+                        else:
+                            missing = upload_data.get('image_missing_count', 0)
+                            user_logger.log_naver_upload_error(
+                                f"임시저장 성공(이미지 누락 {missing}장)"
+                            )
+                    elif upload_data.get('success'):
                         user_logger.log_naver_upload_success(upload_data.get('post_url'))
                     else:
                         user_logger.log_naver_upload_error(upload_data.get('error', '알 수 없는 오류'))
@@ -206,9 +214,41 @@ class BlogGenerationService:
 """
 
         if upload_data and upload_data.get('success'):
-            success_msg += f"\n📤 **네이버 업로드:** 임시저장 완료!"
+            draft_saved = upload_data.get('draft_saved', True)
+            image_ok = upload_data.get('image_included_success', True)
+            missing_count = upload_data.get('image_missing_count', 0)
+            uploaded_count = upload_data.get('image_uploaded_count', 0)
+            requested_count = upload_data.get('image_requested_count', 0)
+
+            if draft_saved and image_ok:
+                success_msg += "\n✅ **네이버 임시저장:** 성공 (이미지 포함)"
+            elif draft_saved:
+                success_msg += (
+                    f"\n⚠️ **네이버 임시저장:** 성공 (텍스트 저장, 이미지 누락 {missing_count}장)"
+                    f"\n• 이미지 상태: {uploaded_count}/{requested_count}장 포함"
+                )
+            else:
+                success_msg += "\n❌ **네이버 임시저장:** 실패"
         elif upload_data:
-            success_msg += f"\n⚠️ **네이버 업로드:** {upload_data.get('error', '실패')}"
+            error_code = upload_data.get('error_code', '')
+            error_detail = upload_data.get('error', '알 수 없는 오류')
+
+            if error_code == 'ENV_NO_XSERVER':
+                success_msg += "\n❌ **네이버 임시저장:** 실패 (환경 설정: XServer 없음)"
+                success_msg += "\n• 해결: HEADLESS=true 또는 xvfb-run -a 사용"
+            elif error_code == 'PLAYWRIGHT_LAUNCH_FAILED':
+                success_msg += "\n❌ **네이버 임시저장:** 실패 (브라우저 실행 오류)"
+                success_msg += "\n• 해결: npx playwright install chromium"
+            elif error_code == 'NAVER_AUTH_FAILED':
+                success_msg += "\n❌ **네이버 임시저장:** 실패 (로그인/세션 만료)"
+                success_msg += "\n• 해결: 네이버 로그인 세션 갱신 필요"
+            elif error_code == 'NETWORK_DNS':
+                success_msg += "\n❌ **네이버 임시저장:** 실패 (네트워크 오류)"
+                success_msg += "\n• 해결: 인터넷 연결 확인"
+            else:
+                success_msg += f"\n❌ **네이버 임시저장:** 실패"
+                success_msg += f"\n• 원인: {error_detail[:200]}"
+
             if upload_data.get('manual_instruction'):
                 success_msg += f"\n💡 {upload_data['manual_instruction']}"
 
@@ -334,7 +374,7 @@ class MaintenanceService:
 
             # 오래된 임시 파일 정리
             from .constants import TEMP_FILE_CLEANUP_HOURS
-            self.image_handler.cleanup_old_temp_files(TEMP_FILE_CLEANUP_HOURS)
+            await self.image_handler.cleanup_old_temp_files(TEMP_FILE_CLEANUP_HOURS)
 
         except Exception as e:
             self.logger.error(f"Error in periodic cleanup: {e}")

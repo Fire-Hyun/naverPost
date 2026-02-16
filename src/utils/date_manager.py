@@ -242,6 +242,7 @@ class DateBasedDirectoryManager:
         try:
             if not date_str:
                 return None
+            filesystem_errors = []
 
             # 직접 디렉토리명인 경우
             try:
@@ -250,15 +251,19 @@ class DateBasedDirectoryManager:
                     return direct_path
             except (OSError, PermissionError) as e:
                 logging.warning(f"Cannot check direct path {date_str}: {e}")
-                # 직접 경로 확인 실패해도 계속 진행
+                filesystem_errors.append(e)
 
             # 날짜 문자열인 경우 가장 최근 디렉토리 찾기
             try:
                 if self._validate_date_format(date_str):
                     # 기본 날짜 디렉토리가 있는지 확인 (기존 형식)
                     base_path = self.base_dir / date_str
-                    if base_path.exists():
-                        return base_path
+                    try:
+                        if base_path.exists():
+                            return base_path
+                    except (OSError, PermissionError) as e:
+                        logging.warning(f"Cannot check base path {base_path}: {e}")
+                        filesystem_errors.append(e)
 
                     # 상호명 포함 형식과 기존 형식 모두 확인
                     patterns = [
@@ -276,6 +281,7 @@ class DateBasedDirectoryManager:
                             all_matching_dirs.extend(matching_dirs)
                         except (OSError, PermissionError) as e:
                             logging.warning(f"Cannot glob pattern {pattern}: {e}")
+                            filesystem_errors.append(e)
                             continue
 
                     if all_matching_dirs:
@@ -284,6 +290,10 @@ class DateBasedDirectoryManager:
 
             except Exception as e:
                 logging.warning(f"Error validating date format for {date_str}: {e}")
+
+            if filesystem_errors:
+                first_error = filesystem_errors[0]
+                raise OSError(f"Cannot get directory path: {first_error}")
 
             return None
 
@@ -349,7 +359,7 @@ class DateBasedDirectoryManager:
             # 파일 저장
             try:
                 with open(metadata_file, 'w', encoding='utf-8') as f:
-                    json.dump(enhanced_data, f, ensure_ascii=False, indent=2, default=str)
+                    json.dump(enhanced_data, f, ensure_ascii=False, indent=2)
                 logging.info(f"Metadata saved successfully: {metadata_file}")
             except PermissionError as e:
                 logging.error(f"Permission denied saving metadata {metadata_file}: {e}")

@@ -160,7 +160,7 @@ class ConversationHandler(SafeMessageMixin):
             session.state = ConversationState.WAITING_IMAGES
 
             # 상호명 보정 로깅
-            user_logger.log_store_name_resolved(text, result.resolved_name)
+            user_logger.log_store_name_resolved(raw_name=text, resolved_name=result.resolved_name)
 
             confirmation_msg = resolver.get_user_confirmation_message(result)
             await update.message.reply_text(f"✅ {confirmation_msg}")
@@ -224,7 +224,7 @@ class ConversationHandler(SafeMessageMixin):
 
         # 사용자별 로깅
         user_logger = get_user_logger(update.effective_user.id)
-        user_logger.log_review_submitted(len(text))
+        user_logger.log_review_submitted(length=len(text))
 
         await update.message.reply_text(self.responses.review_confirmed())
 

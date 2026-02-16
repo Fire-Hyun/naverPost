@@ -336,7 +336,9 @@ class DateBasedDataManager:
                     "ai_additional_script": metadata["user_input"].get("ai_additional_script"),
                     "location": processing_data.get("final_location"),
                     "hashtags": processing_data.get("final_hashtags", []),
-                    "images": metadata.get("images", [])
+                    "images": metadata.get("images", []),
+                    "store_name": metadata["user_input"].get("store_name"),
+                    "location_detail": processing_data.get("location_detail"),
                 },
                 "generation_settings": {
                     "target_length": 1500,

@@ -444,6 +444,67 @@ class BlogContentGenerator:
         except ImportError:
             raise ImportError("openai 패키지가 설치되지 않았습니다. pip install openai로 설치하세요.")
 
+    def _check_content_sufficiency(self, merged_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        입력 충분성을 점수화하여 보강 모드 발동 여부를 결정한다.
+
+        Returns:
+            {
+                "needs_supplementation": bool,
+                "content_score": int,
+                "filled_fields": List[str],
+                "missing_fields": List[str],
+            }
+        """
+        personal_review = merged_data.get("personal_review", "")
+        photo_count = len(merged_data.get("images", []))
+
+        filled_fields: List[str] = []
+        missing_fields: List[str] = []
+        score = 0
+
+        # --- 필드별 키워드 매칭 (각 2점) ---
+        field_patterns = {
+            "메뉴": [r"주문", r"시켰", r"시킨", r"메뉴", r"[가-힣]+밥", r"[가-힣]+면",
+                     r"[가-힣]+탕", r"[가-힣]+찌개", r"[가-힣]+구이", r"파스타", r"피자",
+                     r"커피", r"라떼", r"아메리카노"],
+            "맛": [r"맛있", r"맛없", r"달[았다고]?", r"짜[다고]?", r"매[운웠]",
+                   r"싱거", r"담백", r"느끼", r"고소", r"새콤", r"바삭"],
+            "분위기": [r"분위기", r"인테리어", r"깔끔", r"좁[아은]?", r"넓[은어]?",
+                      r"아늑", r"모던", r"빈티지", r"조용", r"시끄"],
+            "접근성": [r"역\s", r"역에서", r"주차", r"찾기", r"걸어", r"근처",
+                      r"도보", r"주차장", r"골목"],
+            "가격": [r"\d+원", r"가격", r"가성비", r"비싸", r"저렴", r"합리"],
+            "아쉬운점": [r"아쉬", r"별로", r"단점", r"좀 그", r"불편", r"실망",
+                       r"부족", r"그나마"],
+        }
+
+        for field_name, patterns in field_patterns.items():
+            matched = any(
+                re.search(pattern, personal_review) for pattern in patterns
+            )
+            if matched:
+                filled_fields.append(field_name)
+                score += 2
+            else:
+                missing_fields.append(field_name)
+
+        # 사진 수 점수: min(photo_count, 6)
+        score += min(photo_count, 6)
+
+        # 텍스트 길이 보너스
+        if len(personal_review) > 300:
+            score += 2
+
+        needs_supplementation = score < 8
+
+        return {
+            "needs_supplementation": needs_supplementation,
+            "content_score": score,
+            "filled_fields": filled_fields,
+            "missing_fields": missing_fields,
+        }
+
     def generate_blog_post(self, generation_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         generation_ready.json 데이터를 기반으로 블로그 포스트 생성
@@ -459,8 +520,33 @@ class BlogContentGenerator:
             merged_data = generation_data["merged_data"]
             settings = generation_data["generation_settings"]
 
+            # 충분성 체크
+            sufficiency = self._check_content_sufficiency(merged_data)
+
+            # 보강 모드
+            review_snippets: List[str] = []
+            if sufficiency["needs_supplementation"]:
+                try:
+                    from src.content.review_collector import NaverReviewCollector
+                    collector = NaverReviewCollector()
+                    store_name = merged_data.get("store_name", "")
+                    location = merged_data.get("location", "")
+                    if store_name:
+                        review_snippets = collector.collect_review_snippets(
+                            store_name, location
+                        )
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f"리뷰 수집 실패 (무시하고 계속): {e}"
+                    )
+
             # 프롬프트 생성
-            prompt = self._build_generation_prompt(merged_data, settings)
+            prompt = self._build_generation_prompt(
+                merged_data, settings,
+                review_snippets=review_snippets,
+                sufficiency_result=sufficiency,
+            )
 
             # 환경변수에서 OpenAI 설정 로드
             import os
@@ -489,12 +575,18 @@ class BlogContentGenerator:
 
             generated_content = response.choices[0].message.content.strip()
 
-            # 후처리
-            processed_content = self._post_process_content(generated_content, merged_data)
+            # 제목 추출
+            title, body_content = self._extract_title_from_content(generated_content, merged_data)
+
+            # 후처리 (본문만)
+            processed_content = self._post_process_content(body_content, merged_data)
 
             # 결과 구성
+            location_detail = merged_data.get("location_detail")
             return {
                 "success": True,
+                "title": title,
+                "location": location_detail,
                 "generated_content": processed_content,
                 "metadata": {
                     "model_used": model_name,
@@ -503,7 +595,11 @@ class BlogContentGenerator:
                     "total_tokens": response.usage.total_tokens,
                     "generation_timestamp": datetime.now().isoformat(),
                     "target_length": settings["target_length"],
-                    "actual_length": len(processed_content)
+                    "actual_length": len(processed_content),
+                    "supplementation_mode": sufficiency["needs_supplementation"],
+                    "content_score": sufficiency["content_score"],
+                    "review_snippets_used": len(review_snippets),
+                    "title": title,
                 },
                 "quality_metrics": self._calculate_quality_metrics(processed_content, merged_data),
                 "raw_response": generated_content
@@ -522,150 +618,321 @@ class BlogContentGenerator:
         return """너는 실제 사람이 직접 방문하고 쓴 네이버 맛집 블로그 작성자다.
 블로그 마케팅 AI가 아니다.
 
+[제목 생성 규칙]
+- 첫 줄에 반드시 "TITLE: 제목내용" 형식으로 제목을 출력하라.
+- 제목 길이: 공백 포함 최대 25자 이내.
+- 제목에 반드시 상호명을 포함하라.
+- 지역 또는 방문 맥락(첫방문/재방문/웨이팅/분위기 등) 1개를 포함해 정보성을 올려라.
+- "방문 후기", "내돈내산 후기", "솔직 후기" 같은 흔한 템플릿은 금지.
+- 후보 여러 개 금지. 1개만 확정 출력.
+
+[최우선 규칙: 사실/범위 엄격 제한]
+
+- 입력에 없는 사실(가격, 영업시간, 주차, 대표메뉴 이름 등)을 추측해서 쓰지 마라.
+- "내가 직접 봤다/먹었다/직원이 그랬다" 같은 직접 경험 단정은 입력에 명시된 것만 허용한다.
+- 아쉬운 점은 사용자가 명확히 말한 것만 포함하라. 입력에 없으면 아쉬운 점 자체를 쓰지 마라.
+- 입력에 가격이 없으면 가격을 지어내지 마라. 영업시간이 없으면 영업시간을 쓰지 마라.
+- 주차, 웨이팅, 사람 많은지 등도 입력에 있을 때만 언급하라.
+
+[위치 규칙]
+- "위치는 잘 모르겠어요", "위치를 모르겠다" 같은 표현 절대 금지.
+- 위치 정보가 제공되면 본문 상단에 자연스럽게 주소를 언급하라.
+
+[보강 모드 규칙]
+- 보강 스니펫이 제공되면, "후기에서 자주 언급되더라", "리뷰에서 많이 보이더라" 형태의 2차 서술만 허용한다.
+- 보강 스니펫의 내용을 직접 경험한 것처럼 단정하지 마라.
+
 [핵심 스타일 규칙]
 
 1. 인위적인 서론 금지
-   - "오늘은 소개하려고 합니다"
-   - "특별한 경험을 나누고 싶어"
-   - "여러분께 추천드립니다"
-   이런 문장 절대 사용 금지
+   - "오늘은 소개하려고 합니다", "특별한 경험을 나누고 싶어", "여러분께 추천드립니다"
+   절대 사용 금지
 
 2. 말하듯이 작성
-   - 문장 짧게 (15-25자)
-   - 줄바꿈 많이
-   - 한 문단 1~3문장
+   - 문장 짧게 (15-25자), 줄바꿈 많이, 한 문단 1~3문장
 
-3. 사진 중심 구조로 작성
-   - (사진) 표시를 자연스럽게 중간중간 배치
-   - 사진 다음에는 짧은 설명만
+3. 이미지 마커 규칙
+   - [사진1], [사진2] ... [사진N] 형태로 장면 전환 지점에 배치
+   - 사진 앞뒤로 최소 1문단 텍스트를 유지하라. 연속 사진([사진1] 바로 뒤에 [사진2]) 금지.
 
 4. 과한 감정 표현 금지
-   - "완벽했습니다"
-   - "최고였습니다"
-   - "강력 추천드립니다"
-   이런 문장 금지
+   - "완벽했습니다", "최고였습니다", "강력 추천드립니다" 금지
 
-5. 실제 방문자 느낌 유지
-   - 가격 언급
-   - 위치 언급
-   - 주차 여부
-   - 사람이 많았는지
-   - 기다렸는지
-   - 솔직한 아쉬운 점 1개는 포함
+5. 해시태그는 글 맨 아래 5개 이하만 작성
 
-6. 해시태그는 글 맨 아래 5개 이하만 작성
+6. 광고/홍보 느낌 절대 금지
+   - "강력 추천", "꼭 방문해보세요", "완벽", "인생 맛집" 사용 금지
 
-7. 광고/홍보 느낌 절대 금지
-   - "강력 추천"
-   - "꼭 방문해보세요"
-   - "완벽"
-   - "인생 맛집"
-   사용 금지
+7. 글 전체 톤은 긍정을 유지하되 과하지 않게.
 
 8. 1200자 내외로 작성
 9. 문장 길이를 평균 15자~25자로 유지하라.
 완성도보다 자연스러움을 우선하라.
 약간 어색해도 인간이 쓴 것처럼 보여야 한다.
 
+[AI 전형 표현 금지 목록]
+- "정리하자면", "소개해드릴게요", "총평", "결론적으로"
+- "총정리하면", "도움이 되셨다면", "마무리하겠습니다"
+- "여러분", "모든 분들께"
+
 [톤 예시]
 ❌ AI 느낌: "저의 만족도는 5점 만점에 5점이었습니다."
 ⭐ 사람 느낌: "생각보다 괜찮았어요.", "다음에 또 갈 듯."
 
-[글 구조]
+[글 구조 - 사진 번호 매핑]
 - 방문 계기 (짧게)
-- 위치 + 접근성
-- (사진)
+- 위치/접근성 (입력에 있을 때만)
+- [사진1] - 외관/입구
 - 내부 분위기
-- (사진)
-- 메뉴 설명
-- (사진)
-- 음식 비주얼
-- 맛 평가 (솔직하게)
-- 가격 대비 느낌
+- [사진2] - 내부/인테리어
+- 메뉴 선택 과정
+- [사진3] - 음식/제품
+- 맛 평가 (솔직하게, 입력 기반)
+- 아쉬운 점 (입력에 있을 때만)
 - 재방문 의사
 - 해시태그"""
 
-    def _build_generation_prompt(self, merged_data: Dict[str, Any], settings: Dict[str, Any]) -> str:
-        """개선된 생성 프롬프트 구성"""
+    def _build_generation_prompt(
+        self,
+        merged_data: Dict[str, Any],
+        settings: Dict[str, Any],
+        review_snippets: Optional[List[str]] = None,
+        sufficiency_result: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """개선된 생성 프롬프트 구성
 
+        Args:
+            merged_data: 통합 데이터
+            settings: 생성 설정
+            review_snippets: 보강 모드 시 수집된 리뷰 스니펫
+            sufficiency_result: 충분성 체크 결과
+        """
         # 기본 정보 추출
         category = merged_data["category"]
         rating = merged_data.get("rating", 0)
         companion = merged_data.get("companion", "")
         visit_date = merged_data.get("visit_date", "")
         location = merged_data.get("location", "")
+        store_name = merged_data.get("store_name", "")
+        location_detail = merged_data.get("location_detail")
         personal_review = merged_data["personal_review"]
         ai_additional_script = merged_data.get("ai_additional_script", "")
         hashtags = merged_data.get("hashtags", [])
+        images = merged_data.get("images", [])
+        image_tags = merged_data.get("image_tags", [])  # e.g. ["외관", "내부", "음식"]
 
-        # 원본 리뷰에서 핵심 키워드 추출
-        import re
-        key_terms = re.findall(r'[가-힣a-zA-Z0-9]{2,}(?:점|집|카페|리조트|상회|디자인)', personal_review)
-        specific_items = re.findall(r'[가-힣a-zA-Z0-9]{3,}(?=이었|였|했|됐)', personal_review)
+        # 채워진 필드 / 빈 필드 파악
+        filled = sufficiency_result.get("filled_fields", []) if sufficiency_result else []
+        missing = sufficiency_result.get("missing_fields", []) if sufficiency_result else []
 
         # 해시태그에서 키워드 추출 (# 제거)
         hashtag_keywords = [tag.replace('#', '') for tag in hashtags if tag.startswith('#')]
 
-        # 자연스러운 네이버 맛집 블로그 프롬프트 구성
-        prompt = f"""다음 정보를 바탕으로 실제 사람이 쓴 것 같은 자연스러운 네이버 맛집 블로그를 1200자 내외로 작성해라.
+        # --- 프롬프트 빌드 시작 ---
+        prompt_parts = []
 
-[방문 정보]
-- 카테고리: {category}
-- 별점: {rating}/5점 {"⭐" * rating if rating else ""}
-- 동행자: {companion or "혼자"}
-- 방문일: {visit_date or "최근"}
-- 위치: {location or "위치 정보 없음"}
+        prompt_parts.append(
+            "다음 정보를 바탕으로 실제 사람이 쓴 것 같은 자연스러운 네이버 맛집 블로그를 1200자 내외로 작성해라."
+        )
 
-[실제 경험담 - 이걸 기반으로 써라]
-{personal_review}
+        # 방문 정보 (채워진 필드만)
+        prompt_parts.append("\n[방문 정보]")
+        prompt_parts.append(f"- 카테고리: {category}")
+        if store_name:
+            prompt_parts.append(f"- 상호명: {store_name}")
+        if rating:
+            prompt_parts.append(f"- 별점: {rating}/5점")
+        if companion:
+            prompt_parts.append(f"- 동행자: {companion}")
+        if visit_date:
+            prompt_parts.append(f"- 방문일: {visit_date}")
+        if location:
+            prompt_parts.append(f"- 위치: {location}")
 
-[핵심 키워드 - 자연스럽게 포함할 것]
-- 장소/브랜드명: {', '.join(key_terms[:3]) if key_terms else "구체적 장소명 언급"}
-- 특별한 요소: {', '.join(specific_items[:2]) if specific_items else "독특한 특징 묘사"}
+        # 위치 상세 정보 (네이버지도 API 조회 결과)
+        if location_detail:
+            prompt_parts.append(f"\n[위치 정보 - 본문 상단에 자연스럽게 반영하라]")
+            prompt_parts.append(f"- 상호명: {location_detail['name']}")
+            prompt_parts.append(f"- 주소: {location_detail['address']}")
+            if location_detail.get('phone'):
+                prompt_parts.append(f"- 전화번호: {location_detail['phone']}")
+            if location_detail.get('category'):
+                prompt_parts.append(f"- 카테고리: {location_detail['category']}")
+            prompt_parts.append("본문 초반 '방문 계기' 직후에 주소를 자연스럽게 1-2문장으로 언급하라.")
 
-[추가 요청]
-{ai_additional_script or "없음"}
+        # 실제 경험담
+        prompt_parts.append(f"\n[실제 경험담 - 이걸 기반으로 써라]\n{personal_review}")
 
-[이미지 개수: {len(merged_data.get('images', []))}장]
-글 중간중간에 (사진) 표시를 {len(merged_data.get('images', []))}번 자연스럽게 넣어라.
+        # 추가 요청
+        if ai_additional_script:
+            prompt_parts.append(f"\n[추가 요청]\n{ai_additional_script}")
 
-[사용할 해시태그]
-{', '.join(hashtag_keywords[:5]) if hashtag_keywords else "맛집, 음식"}
+        # 이미지 마커 지시
+        num_images = len(images)
+        prompt_parts.append(f"\n[이미지: {num_images}장]")
+        if image_tags and len(image_tags) == num_images:
+            tag_list = ", ".join(
+                f"[사진{i+1}: {tag}]" for i, tag in enumerate(image_tags)
+            )
+            prompt_parts.append(f"다음 사진 마커를 장면 전환 지점에 배치하라: {tag_list}")
+        else:
+            markers = ", ".join(f"[사진{i+1}]" for i in range(num_images))
+            prompt_parts.append(
+                f"글 중간중간에 {markers} 마커를 장면 전환 지점에 배치하라."
+            )
+        prompt_parts.append("사진 앞뒤로 최소 1문단 텍스트를 유지하고 연속 사진은 금지한다.")
 
+        # 해시태그
+        if hashtag_keywords:
+            prompt_parts.append(
+                f"\n[사용할 해시태그]\n{', '.join(hashtag_keywords[:5])}"
+            )
+
+        # 보강 모드 리뷰 스니펫
+        if review_snippets:
+            prompt_parts.append("\n[보강 자료: 다른 블로그 후기에서 추출한 공통 키워드]")
+            for i, snippet in enumerate(review_snippets, 1):
+                prompt_parts.append(f"  {i}. {snippet}")
+            prompt_parts.append(
+                '이 중 2~4개만 골라 "후기에서 자주 보이더라", "리뷰에서 많이 언급되더라" 형태로 자연스럽게 녹여라.'
+            )
+            prompt_parts.append("직접 경험한 것처럼 단정하지 마라.")
+
+        # 빈 필드에 대한 금지 지시
+        if missing:
+            prompt_parts.append("\n[언급 금지 항목 - 입력에 없으므로 지어내지 마라]")
+            field_labels = {
+                "메뉴": "구체적 메뉴 이름/가격",
+                "맛": "맛 평가",
+                "분위기": "분위기/인테리어 묘사",
+                "접근성": "접근성/주차/위치 상세",
+                "가격": "가격/가성비",
+                "아쉬운점": "아쉬운 점",
+            }
+            for field in missing:
+                label = field_labels.get(field, field)
+                prompt_parts.append(f"  - {label}")
+
+        # 아쉬운 점 처리
+        if "아쉬운점" in filled:
+            prompt_parts.append("\n사용자가 언급한 아쉬운 점을 한 번 자연스럽게 언급하라.")
+        else:
+            prompt_parts.append("\n아쉬운 점을 지어내지 마라. 아쉬운 점 섹션 자체를 생략하라.")
+
+        # 작성 규칙
+        prompt_parts.append("""
 [필수 작성 규칙]
 1. 문장 길이 15-25자로 짧게
 2. 줄바꿈 자주 사용
 3. 한 문단 최대 3문장
-4. 솔직한 아쉬운 점 1개 포함
-5. 가격 언급 필수
-6. 위치/접근성 언급
-7. 사람 많았는지/기다렸는지 언급
-8. 재방문 의사 표현
+4. 입력에 있는 정보만 사용 (없는 사실을 추측하지 마라)
+5. 재방문 의사 표현
 
 [금지 표현]
 - "오늘은 소개하려고", "여러분께", "추천드립니다"
 - "완벽했습니다", "최고였습니다", "강력 추천"
-- "총정리하면", "도움이 되셨다면"
+- "총정리하면", "도움이 되셨다면", "정리하자면", "소개해드릴게요", "총평", "결론적으로"
 
-[글 구조]
-1. 방문 계기 (왜 갔는지)
-2. 위치/찾기 쉬운지
-3. (사진) - 외관
-4. 내부 분위기
-5. (사진) - 인테리어
-6. 메뉴 선택
-7. (사진) - 음식
-8. 맛 솔직 평가
-9. 가격 언급
-10. 아쉬운 점 1개
-11. 재방문 의사
-12. 해시태그 (맨 마지막, 5개 이하)
+[글 구조]""")
 
+        # 동적 글 구조 (사진 번호 매핑)
+        structure_items = ["1. 방문 계기 (왜 갔는지)"]
+        if "접근성" in filled or location or location_detail:
+            structure_items.append("2. 위치/찾기 쉬운지")
+
+        photo_idx = 1
+        if num_images >= 1:
+            structure_items.append(f"{len(structure_items)+1}. [사진{photo_idx}] - 외관/입구")
+            photo_idx += 1
+        structure_items.append(f"{len(structure_items)+1}. 내부 분위기")
+        if num_images >= 2:
+            structure_items.append(f"{len(structure_items)+1}. [사진{photo_idx}] - 인테리어")
+            photo_idx += 1
+        if "메뉴" in filled:
+            structure_items.append(f"{len(structure_items)+1}. 메뉴 선택")
+        if num_images >= 3:
+            structure_items.append(f"{len(structure_items)+1}. [사진{photo_idx}] - 음식/제품")
+            photo_idx += 1
+        # 남은 사진
+        while photo_idx <= num_images:
+            structure_items.append(f"{len(structure_items)+1}. [사진{photo_idx}]")
+            photo_idx += 1
+        if "맛" in filled:
+            structure_items.append(f"{len(structure_items)+1}. 맛 솔직 평가")
+        if "가격" in filled:
+            structure_items.append(f"{len(structure_items)+1}. 가격 언급")
+        if "아쉬운점" in filled:
+            structure_items.append(f"{len(structure_items)+1}. 아쉬운 점")
+        structure_items.append(f"{len(structure_items)+1}. 재방문 의사")
+        structure_items.append(f"{len(structure_items)+1}. 해시태그 (맨 마지막, 5개 이하)")
+
+        prompt_parts.append("\n".join(structure_items))
+
+        prompt_parts.append("""
 **톤**: 친구한테 얘기하듯 자연스럽게.
 "생각보다 괜찮았어요", "다음에 또 갈 듯" 이런 느낌으로.
-완성도보다 자연스러움이 중요해."""
+완성도보다 자연스러움이 중요해.""")
 
-        return prompt
+        return "\n".join(prompt_parts)
+
+    def _extract_title_from_content(self, content: str, merged_data: Dict[str, Any]) -> tuple:
+        """
+        생성된 콘텐츠에서 TITLE: 줄을 분리한다.
+
+        Returns:
+            (title, body_content) 튜플
+        """
+        title = ""
+        body = content
+
+        # TITLE: 줄 파싱
+        lines = content.split("\n", 1)
+        if lines and lines[0].strip().startswith("TITLE:"):
+            title = lines[0].strip().replace("TITLE:", "").strip()
+            body = lines[1].strip() if len(lines) > 1 else ""
+
+        # 제목 검증 및 보정
+        store_name = merged_data.get("store_name", "")
+        title = self._validate_title(title, store_name)
+
+        return title, body
+
+    def _validate_title(self, title: str, store_name: str) -> str:
+        """제목 검증 및 보정"""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        if not title:
+            # 제목이 없으면 상호명 기반으로 생성
+            if store_name:
+                title = store_name
+            else:
+                title = "블로그 포스팅"
+            logger.warning(f"제목이 비어있어 기본값 사용: {title}")
+
+        # 25자 초과 시 축약
+        if len(title) > 25:
+            logger.warning(f"제목이 25자 초과 ({len(title)}자): {title}")
+            title = title[:25]
+
+        # 상호명 미포함 시 앞에 붙이기
+        if store_name and store_name not in title:
+            candidate = f"{store_name} {title}"
+            if len(candidate) <= 25:
+                title = candidate
+            else:
+                # 상호명만이라도 포함
+                title = store_name + " " + title[:25 - len(store_name) - 1]
+                title = title[:25]
+            logger.warning(f"상호명을 제목에 추가: {title}")
+
+        # 흔한 패턴 감지
+        banned_patterns = ["방문 후기", "내돈내산", "솔직 후기"]
+        for pattern in banned_patterns:
+            if pattern in title:
+                logger.warning(f"제목에 흔한 패턴 감지됨: '{pattern}' in '{title}'")
+
+        return title
 
     def _post_process_content(self, content: str, merged_data: Dict[str, Any]) -> str:
         """자연스러운 네이버 블로그 스타일로 후처리"""
@@ -673,7 +940,7 @@ class BlogContentGenerator:
         # 1. 불필요한 따옴표 제거
         content = content.strip('"\'')
 
-        # 2. AI 전형 표현 강력 필터링
+        # 2. AI 전형 표현 강력 필터링 (목록 확대)
         ai_patterns = [
             r'오늘은? 소개하려고\s*,?',
             r'특별한 경험을 나누고 싶어\s*,?',
@@ -687,12 +954,32 @@ class BlogContentGenerator:
             r'꼭 방문해보세요\s*,?',
             r'인생 맛집\s*,?',
             r'여러분\s*,?',
-            r'모든 분들께\s*,?'
+            r'모든 분들께\s*,?',
+            r'정리하자면\s*,?',
+            r'소개해\s*드릴게요\s*,?',
+            r'총평\s*:?\s*',
+            r'결론적으로\s*,?',
         ]
         for pattern in ai_patterns:
             content = re.sub(pattern, '', content, flags=re.IGNORECASE)
 
-        # 3. 해시태그 처리 (맨 마지막에 5개 이하만)
+        # 3. 이미지 마커 포맷 정규화 — 다양한 형태를 [사진N]으로 통일
+        # (사진) → [사진N] 순차 치환
+        photo_counter = [0]
+
+        def _replace_unnamed_photo(match):
+            photo_counter[0] += 1
+            return f"\n\n[사진{photo_counter[0]}]\n\n"
+
+        content = re.sub(r'\s*\(사진\)\s*', _replace_unnamed_photo, content)
+
+        # (사진N) → [사진N]
+        content = re.sub(r'\(사진(\d+)\)', r'[사진\1]', content)
+
+        # 이미 [사진N] 형태인 것은 유지, 주변 줄바꿈 정리
+        content = re.sub(r'\s*\[사진(\d+)\]\s*', r'\n\n[사진\1]\n\n', content)
+
+        # 4. 해시태그 처리 (맨 마지막에 5개 이하만)
         hashtags = merged_data.get("hashtags", [])
 
         # 기존 해시태그 제거 (글 중간에 있을 수 있음)
@@ -703,30 +990,43 @@ class BlogContentGenerator:
             clean_hashtags = hashtags[:5]
             content = content.rstrip() + f"\n\n{' '.join(clean_hashtags)}"
 
-        # 4. 문장 길이 조정 (너무 긴 문장 분리)
+        # 5. 문장 길이 조정 (너무 긴 문장 분리)
         lines = content.split('\n')
         processed_lines = []
 
         for line in lines:
             line = line.strip()
             if len(line) > 50 and '.' in line:
-                # 긴 문장을 적절히 분리
                 sentences = line.split('.')
-                for i, sentence in enumerate(sentences[:-1]):  # 마지막 빈 문자열 제외
+                for i, sentence in enumerate(sentences[:-1]):
                     if sentence.strip():
                         processed_lines.append(sentence.strip() + '.')
-                if sentences[-1].strip():  # 마지막 부분이 있으면
+                if sentences[-1].strip():
                     processed_lines.append(sentences[-1].strip())
             elif line:
                 processed_lines.append(line)
 
         content = '\n'.join(processed_lines)
 
-        # 5. 과도한 줄바꿈 정리 (하지만 짧은 문단 유지)
-        content = re.sub(r'\n{4,}', '\n\n\n', content)  # 4개 이상 → 3개로
+        # 6. 과도한 줄바꿈 정리 (하지만 짧은 문단 유지)
+        content = re.sub(r'\n{4,}', '\n\n\n', content)
 
-        # 6. (사진) 표시 정리
-        content = re.sub(r'\s*\(사진\)\s*', '\n\n(사진)\n\n', content)
+        # 7. 검증: 이미지 마커 존재 여부
+        image_markers = re.findall(r'\[사진\d+\]', content)
+        if not image_markers:
+            # 마커가 하나도 없으면 경고 플래그 (content 자체는 유지)
+            import logging
+            logging.getLogger(__name__).warning(
+                "후처리 경고: 이미지 마커가 1개도 없습니다."
+            )
+
+        # 8. 검증: 연속 사진 마커 감지
+        consecutive_pattern = re.findall(r'\[사진\d+\]\s*\n?\s*\[사진\d+\]', content)
+        if consecutive_pattern:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"후처리 경고: 연속 사진 마커 {len(consecutive_pattern)}건 감지"
+            )
 
         return content.strip()
 
@@ -748,9 +1048,53 @@ class BlogContentGenerator:
         hashtag_included = sum(1 for tag in hashtags if tag in content)
         hashtag_inclusion_rate = hashtag_included / max(len(hashtags), 1)
 
-        # AI 전형 표현 감지
-        ai_patterns = ['총정리하면', '도움이 되셨다면', '마무리하겠습니다', '여러분', '모든 분들께']
+        # AI 전형 표현 감지 (확대)
+        ai_patterns = [
+            '총정리하면', '도움이 되셨다면', '마무리하겠습니다',
+            '여러분', '모든 분들께',
+            '정리하자면', '소개해드릴게요', '총평', '결론적으로',
+        ]
         ai_expression_count = sum(1 for pattern in ai_patterns if pattern in content)
+
+        # 이미지 마커 개수
+        image_markers = re.findall(r'\[사진\d+\]', content)
+        image_marker_count = len(image_markers)
+
+        # 연속 사진 여부
+        has_consecutive_photos = bool(
+            re.search(r'\[사진\d+\]\s*\n?\s*\[사진\d+\]', content)
+        )
+
+        # 날조 사실 위험 감지 — 입력에 없는 가격/시간/주차 등을 AI가 단정한 경우
+        personal_review = merged_data.get("personal_review", "")
+        fabricated_fact_risk = 0
+
+        # 가격이 입력에 없는데 본문에 구체적 가격이 있으면 위험
+        if not re.search(r'\d+원', personal_review) and re.search(r'\d+원', content):
+            fabricated_fact_risk += 1
+        # 영업시간이 입력에 없는데 본문에 있으면 위험
+        if not re.search(r'\d+시', personal_review) and re.search(r'\d+시', content):
+            fabricated_fact_risk += 1
+        # 주차가 입력에 없는데 본문에 구체적 주차 언급이 있으면 위험
+        if '주차' not in personal_review and re.search(r'주차\s*(가능|무료|유료|\d+대)', content):
+            fabricated_fact_risk += 1
+
+        # quality_score 계산 (새 메트릭 반영)
+        base_score = (
+            experience_overlap * 0.3
+            + hashtag_inclusion_rate * 0.2
+            + (1 - min(ai_expression_count / 3, 1)) * 0.2
+        )
+        # 이미지 마커 보너스 (있으면 가산)
+        marker_bonus = min(image_marker_count / max(len(merged_data.get("images", [])), 1), 1.0) * 0.1
+        # 연속 사진 감점
+        consecutive_penalty = 0.05 if has_consecutive_photos else 0
+        # 날조 사실 감점
+        fabrication_penalty = min(fabricated_fact_risk * 0.05, 0.15)
+
+        quality_score = round(
+            (base_score + marker_bonus - consecutive_penalty - fabrication_penalty) * 100, 1
+        )
 
         return {
             "char_count": char_count,
@@ -759,11 +1103,10 @@ class BlogContentGenerator:
             "experience_overlap_ratio": round(experience_overlap, 2),
             "hashtag_inclusion_rate": round(hashtag_inclusion_rate, 2),
             "ai_expression_count": ai_expression_count,
-            "quality_score": round(
-                (experience_overlap * 0.4 +
-                 hashtag_inclusion_rate * 0.3 +
-                 (1 - min(ai_expression_count / 3, 1)) * 0.3) * 100, 1
-            )
+            "image_marker_count": image_marker_count,
+            "has_consecutive_photos": has_consecutive_photos,
+            "fabricated_fact_risk": fabricated_fact_risk,
+            "quality_score": max(quality_score, 0),
         }
 
 
@@ -839,11 +1182,18 @@ class DateBasedBlogGenerator:
             # 3단계: 생성 성공 - 결과 저장
             generated_content = generation_result["generated_content"]
             metadata = generation_result["metadata"]
+            title = generation_result.get("title", "")
+
+            # TITLE: 줄을 본문 맨 앞에 포함하여 저장 (naver-poster parser가 파싱)
+            if title:
+                blog_content_with_title = f"TITLE: {title}\n\n{generated_content}"
+            else:
+                blog_content_with_title = generated_content
 
             # 마크다운 형식으로 저장
             blog_file_path = self.data_manager.save_blog_result(
                 date_directory,
-                generated_content,
+                blog_content_with_title,
                 metadata
             )
 

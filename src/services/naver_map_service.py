@@ -1,11 +1,11 @@
 """
-네이버 지도 API 연동 서비스
+네이버 지도 API 연동 서비스 (안정화 버전)
 
-네이버 지도 API를 활용한 다양한 지도 관련 기능을 제공합니다.
+안정화된 네이버 지도 API를 활용한 다양한 지도 관련 기능을 제공합니다.
 - 지도 표시
 - 주소/좌표 변환 (Geocoding/Reverse Geocoding)
 - 정적 지도 이미지 생성
-- 장소 검색
+- 장소 검색 (재시도, 캐싱, 레이트 리밋 적용)
 """
 
 import asyncio
@@ -17,16 +17,28 @@ from urllib.parse import quote, urlencode
 import logging
 
 from src.config.settings import Settings
+from src.utils.naver_map_client import StabilizedNaverMapClient, create_naver_map_client, MapLocation
+from src.utils.structured_logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger("naver_map_service")
 
 @dataclass
 class Location:
-    """위치 정보를 담는 데이터 클래스"""
+    """위치 정보를 담는 데이터 클래스 (호환성 유지)"""
     lat: float
     lng: float
     address: str = ""
     name: str = ""
+
+    @classmethod
+    def from_map_location(cls, map_loc: MapLocation) -> 'Location':
+        """MapLocation을 Location으로 변환"""
+        return cls(
+            lat=map_loc.lat,
+            lng=map_loc.lng,
+            address=map_loc.address or map_loc.road_address,
+            name=map_loc.name
+        )
 
 @dataclass
 class MapOptions:
@@ -39,7 +51,7 @@ class MapOptions:
     format: str = "png"  # png, jpg
 
 class NaverMapService:
-    """네이버 지도 API 서비스 클래스"""
+    """네이버 지도 API 서비스 클래스 (안정화 버전)"""
 
     def __init__(self):
         self.client_id = Settings.NAVER_MAP_CLIENT_ID
@@ -48,6 +60,10 @@ class NaverMapService:
         if not self.client_id or not self.client_secret:
             raise ValueError("네이버 지도 API 클라이언트 ID와 시크릿이 설정되지 않았습니다.")
 
+        # 안정화된 클라이언트 사용
+        self.stabilized_client = create_naver_map_client()
+
+        # 레거시 헤더들 (하위 호환성)
         self.base_url = "https://naveropenapi.apigw.ntruss.com"
         self.headers = {
             "X-NCP-APIGW-API-KEY-ID": self.client_id,
@@ -60,9 +76,68 @@ class NaverMapService:
             "X-Naver-Client-Secret": self.client_secret
         }
 
+    async def fetch_place_by_store_name(
+        self, store_name: str, region_hint: str = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        상호명으로 장소 정보를 조회한다.
+
+        Args:
+            store_name: 상호명 (예: "하이디라오 연동점")
+            region_hint: 지역 힌트 (예: "제주", "강남")
+
+        Returns:
+            장소 정보 dict 또는 None (조회 실패 시)
+        """
+        if not store_name or not store_name.strip():
+            logger.warning("Empty store_name provided")
+            return None
+
+        try:
+            # 검색 쿼리 구성
+            search_query = f"{region_hint} {store_name}" if region_hint else store_name
+            logger.info("Fetching place by store name", store_name=store_name, region_hint=region_hint, query=search_query)
+
+            search_result = await self.stabilized_client.search_place(search_query, similarity_threshold=0.1)
+
+            # 결과 0건이고 region_hint가 있었으면 store_name만으로 재시도
+            if (not search_result.success or not search_result.locations) and region_hint:
+                logger.info("Retrying without region hint", store_name=store_name)
+                search_result = await self.stabilized_client.search_place(store_name, similarity_threshold=0.1)
+
+            if not search_result.success or not search_result.locations:
+                logger.warning("No place found for store name", store_name=store_name)
+                return None
+
+            # 최적 결과 선택: similarity_score 최대
+            best = search_result.get_best_match()
+            if not best:
+                return None
+
+            logger.info(
+                "Place found",
+                store_name=store_name,
+                found_name=best.name,
+                similarity=best.similarity_score,
+            )
+
+            return {
+                "name": best.name,
+                "address": best.road_address or best.address,
+                "jibun_address": best.jibun_address,
+                "lat": best.lat,
+                "lng": best.lng,
+                "phone": best.phone,
+                "category": best.category,
+            }
+
+        except Exception as e:
+            logger.error("fetch_place_by_store_name failed", error=e, store_name=store_name)
+            return None
+
     async def geocode(self, address: str) -> Optional[Location]:
         """
-        주소를 좌표로 변환 (Geocoding)
+        주소를 좌표로 변환 (Geocoding) - 안정화 버전
 
         Args:
             address: 변환할 주소
@@ -70,70 +145,52 @@ class NaverMapService:
         Returns:
             Location 객체 또는 None
         """
-        # 장소 검색을 통한 좌표 추출 시도 (네이버 지역 검색 API 활용)
+        if not address or not address.strip():
+            logger.warning("Empty address provided for geocoding")
+            return None
+
         try:
-            url = "https://openapi.naver.com/v1/search/local.json"
-            params = {"query": address, "display": 5}  # 검색 결과를 5개로 증가
+            logger.info("Starting geocoding", address=address)
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=self.naver_dev_headers, params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
+            # 안정화된 클라이언트로 검색
+            search_result = await self.stabilized_client.search_place(address, similarity_threshold=0.1)
 
-                        if data.get("total", 0) > 0 and len(data.get("items", [])) > 0:
-                            # 가장 관련성 높은 결과 선택
-                            for item in data["items"]:
-                                if item.get("mapx") and item.get("mapy"):
-                                    return Location(
-                                        lat=float(item["mapy"]) / 10000000,
-                                        lng=float(item["mapx"]) / 10000000,
-                                        address=item.get("address", ""),
-                                        name=item.get("title", "").replace("<b>", "").replace("</b>", "") or address
-                                    )
-                    else:
-                        logger.warning(f"네이버 지역 검색 API 오류: {response.status}")
+            if search_result.success and search_result.locations:
+                # 가장 유사도가 높은 결과 선택
+                best_match = search_result.get_best_match()
+
+                if best_match:
+                    logger.info("Geocoding successful",
+                              address=address,
+                              found_name=best_match.name,
+                              similarity=best_match.similarity_score,
+                              cache_hit=search_result.cache_hit)
+
+                    return Location.from_map_location(best_match)
+                else:
+                    logger.warning("No suitable matches found for geocoding", address=address)
+            else:
+                logger.warning("Geocoding failed",
+                             address=address,
+                             error_type=search_result.error_type,
+                             error_message=search_result.error_message)
+
+                # fallback: NCP Geocoding API 시도 (기존 로직 유지)
+                return await self._fallback_ncp_geocoding(address)
 
         except Exception as e:
-            logger.warning(f"네이버 지역 검색을 통한 Geocoding 중 오류 발생: {e}")
+            logger.error("Geocoding error", error=e, address=address)
 
-        # 더 간단한 키워드로 재시도
-        simple_keywords = [
-            address.split()[-2:],  # 마지막 두 단어
-            [address.split()[-1]],  # 마지막 한 단어
-            ["서울시청"] if "세종대로" in address else
-            ["강남역"] if "테헤란로" in address else
-            ["해운대"] if "해운대" in address else
-            ["제주도"] if "제주" in address else []
-        ]
+            # fallback: NCP Geocoding API 시도
+            return await self._fallback_ncp_geocoding(address)
 
-        for keywords in simple_keywords:
-            if not keywords:
-                continue
+        return None
 
-            try:
-                query = " ".join(keywords)
-                url = "https://openapi.naver.com/v1/search/local.json"
-                params = {"query": query, "display": 1}
-
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, headers=self.naver_dev_headers, params=params) as response:
-                        if response.status == 200:
-                            data = await response.json()
-
-                            if data.get("total", 0) > 0 and len(data.get("items", [])) > 0:
-                                item = data["items"][0]
-                                if item.get("mapx") and item.get("mapy"):
-                                    return Location(
-                                        lat=float(item["mapy"]) / 10000000,
-                                        lng=float(item["mapx"]) / 10000000,
-                                        address=item.get("address", ""),
-                                        name=item.get("title", "").replace("<b>", "").replace("</b>", "") or address
-                                    )
-            except Exception:
-                continue
-
-        # NCP Geocoding API 시도 (fallback)
+    async def _fallback_ncp_geocoding(self, address: str) -> Optional[Location]:
+        """NCP Geocoding API 폴백"""
         try:
+            logger.info("Trying fallback NCP geocoding", address=address)
+
             url = f"{self.base_url}/map-geocode/v2/geocode"
             params = {"query": address}
 
@@ -142,19 +199,21 @@ class NaverMapService:
                     if response.status == 200:
                         data = await response.json()
 
-                        if data["meta"]["totalCount"] > 0:
+                        if data.get("meta", {}).get("totalCount", 0) > 0:
                             result = data["addresses"][0]
-                            return Location(
+                            location = Location(
                                 lat=float(result["y"]),
                                 lng=float(result["x"]),
-                                address=result["roadAddress"] or result["jibunAddress"],
+                                address=result.get("roadAddress") or result.get("jibunAddress", ""),
                                 name=address
                             )
+                            logger.info("NCP geocoding successful", address=address)
+                            return location
                     else:
-                        logger.error(f"NCP Geocoding API 오류: {response.status}")
+                        logger.warning("NCP Geocoding API error", status_code=response.status, address=address)
 
         except Exception as e:
-            logger.error(f"NCP Geocoding 중 오류 발생: {e}")
+            logger.error("NCP Geocoding error", error=e, address=address)
 
         return None
 
@@ -255,7 +314,7 @@ class NaverMapService:
 
     async def search_places(self, query: str, lat: float = None, lng: float = None, radius: int = 5000) -> List[Location]:
         """
-        장소 검색
+        장소 검색 - 안정화 버전
 
         Args:
             query: 검색할 장소명
@@ -266,52 +325,44 @@ class NaverMapService:
         Returns:
             검색된 장소 목록
         """
-        places = []
-
         try:
-            # 네이버 지역 검색 API 사용
-            url = "https://openapi.naver.com/v1/search/local.json"
-            headers = {
-                "X-Naver-Client-Id": Settings.NAVER_CLIENT_ID,
-                "X-Naver-Client-Secret": Settings.NAVER_CLIENT_SECRET
-            }
+            logger.info("Starting place search", query=query, lat=lat, lng=lng, radius=radius)
 
-            params = {
-                "query": query,
-                "display": 10,
-                "start": 1,
-                "sort": "random"
-            }
+            # 안정화된 클라이언트로 검색
+            search_result = await self.stabilized_client.search_place(query, similarity_threshold=0.0)
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
+            if search_result.success and search_result.locations:
+                places = []
 
-                        for item in data.get("items", []):
-                            # 좌표가 있는 경우에만 추가
-                            if item.get("mapx") and item.get("mapy"):
-                                location = Location(
-                                    lat=float(item["mapy"]) / 10000000,  # 네이버 API는 좌표에 10^7을 곱한 값 반환
-                                    lng=float(item["mapx"]) / 10000000,
-                                    address=item.get("address", ""),
-                                    name=item.get("title", "").replace("<b>", "").replace("</b>", "")
-                                )
+                for map_location in search_result.locations:
+                    location = Location.from_map_location(map_location)
 
-                                # 거리 필터링 (중심 좌표가 제공된 경우)
-                                if lat is not None and lng is not None:
-                                    distance = self._calculate_distance(lat, lng, location.lat, location.lng)
-                                    if distance <= radius:
-                                        places.append(location)
-                                else:
-                                    places.append(location)
+                    # 거리 필터링 (중심 좌표가 제공된 경우)
+                    if lat is not None and lng is not None:
+                        distance = self._calculate_distance(lat, lng, location.lat, location.lng)
+                        if distance <= radius:
+                            places.append(location)
                     else:
-                        logger.error(f"장소 검색 API 오류: {response.status}")
+                        places.append(location)
+
+                logger.info("Place search completed",
+                          query=query,
+                          total_found=len(search_result.locations),
+                          after_radius_filter=len(places),
+                          cache_hit=search_result.cache_hit)
+
+                return places
+
+            else:
+                logger.warning("Place search failed",
+                             query=query,
+                             error_type=search_result.error_type,
+                             error_message=search_result.error_message)
+                return []
 
         except Exception as e:
-            logger.error(f"장소 검색 중 오류 발생: {e}")
-
-        return places
+            logger.error("Place search error", error=e, query=query)
+            return []
 
     def _calculate_distance(self, lat1: float, lng1: float, lat2: float, lng2: float) -> float:
         """
@@ -358,36 +409,43 @@ class NaverMapService:
 
     async def validate_api_keys(self) -> bool:
         """
-        API 키 유효성 검증
+        API 키 유효성 검증 - 안정화 버전
 
         Returns:
             API 키 유효 여부
         """
-        # 네이버 개발자센터 API 검증 먼저 시도
         try:
-            url = "https://openapi.naver.com/v1/search/local.json"
-            params = {"query": "테스트", "display": 1}
+            logger.info("Validating Naver Map API keys")
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=self.naver_dev_headers, params=params) as response:
-                    if response.status == 200:
-                        return True
-                    elif response.status == 401:
-                        logger.warning("네이버 개발자센터 API 키 인증 실패")
-                    else:
-                        logger.warning(f"네이버 개발자센터 API 응답: {response.status}")
+            # 안정화된 클라이언트의 검증 메소드 사용
+            is_valid = await self.stabilized_client.validate_api_connection()
+
+            if is_valid:
+                logger.info("API key validation successful")
+            else:
+                logger.warning("API key validation failed")
+
+            return is_valid
 
         except Exception as e:
-            logger.warning(f"네이버 개발자센터 API 검증 중 오류: {e}")
-
-        # NCP API 검증 시도 (fallback)
-        try:
-            # 간단한 Geocoding API 호출로 테스트
-            result = await self.geocode("서울")
-            return result is not None
-        except Exception as e:
-            logger.error(f"API 키 검증 중 오류 발생: {e}")
+            logger.error("API key validation error", error=e)
             return False
+
+    async def cleanup(self):
+        """리소스 정리"""
+        try:
+            await self.stabilized_client.close()
+            logger.info("NaverMapService cleanup completed")
+        except Exception as e:
+            logger.error("Error during NaverMapService cleanup", error=e)
+
+    def get_service_metrics(self) -> Dict[str, Any]:
+        """서비스 메트릭 반환"""
+        try:
+            return self.stabilized_client.get_search_metrics()
+        except Exception as e:
+            logger.error("Error getting service metrics", error=e)
+            return {"error": str(e)}
 
 
 # 전역 인스턴스

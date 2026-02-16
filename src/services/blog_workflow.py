@@ -7,6 +7,7 @@ import logging
 import subprocess
 import json
 import inspect
+import random
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Union, Callable
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ from src.config.settings import Settings
 from src.services.quality import BlogQualityVerifier
 from src.services.generation import BlogContentManager
 from src.services.browser import BrowserSessionManager, BrowserCleanupService
+from src.services.naver_map_service import NaverMapService
 
 
 class WorkflowStatus(Enum):
@@ -211,6 +213,9 @@ class BlogWorkflowService:
             progress.results['session'] = session_result.data
             active_directory = session_result.data.get('directory', date_directory) if session_result.data else date_directory
 
+            # Step 2.5: 위치 정보 조회 (실패해도 계속 진행)
+            await self._fetch_location_info(active_directory, user_experience)
+
             # Step 3: AI 블로그 생성
             await self._update_progress(progress, 3, WorkflowStatus.GENERATING_BLOG,
                                      "블로그 생성", "AI를 사용하여 블로그를 생성하고 있습니다...",
@@ -385,6 +390,42 @@ class BlogWorkflowService:
                 error=str(e)
             )
 
+    async def _fetch_location_info(
+        self,
+        date_directory: str,
+        user_experience: Dict[str, Any],
+    ) -> None:
+        """
+        상호명으로 위치 정보를 조회하여 AI 처리 데이터에 반영한다.
+        실패해도 워크플로우를 중단하지 않는다.
+        """
+        store_name = user_experience.get("store_name")
+        if not store_name:
+            self.logger.info("No store_name provided, skipping location lookup")
+            return
+
+        try:
+            naver_map = NaverMapService()
+            # region_hint: user_experience에 location 정보가 있으면 활용
+            region_hint = user_experience.get("location") or None
+            location_detail = await naver_map.fetch_place_by_store_name(store_name, region_hint)
+
+            if location_detail:
+                self.logger.info(
+                    f"Location found for '{store_name}': {location_detail.get('address', '')}"
+                )
+            else:
+                self.logger.warning(f"Location not found for '{store_name}', proceeding without location")
+
+            # user_experience에 location_detail 추가 (이후 save_ai_processing_data에서 반영됨)
+            user_experience["location_detail"] = location_detail
+
+            await naver_map.cleanup()
+
+        except Exception as e:
+            self.logger.warning(f"Location lookup failed for '{store_name}': {e}. Proceeding without location.")
+            user_experience["location_detail"] = None
+
     async def _generate_blog_content(self, date_directory: str) -> WorkflowStepResult:
         """AI 블로그 콘텐츠 생성 - 통합된 생성 관리자 사용"""
 
@@ -495,48 +536,137 @@ class BlogWorkflowService:
                     error=f"데이터 디렉토리를 찾을 수 없습니다: {data_path}"
                 )
 
-            # naver-poster 실행
-            cmd = [
-                "npx", "tsx", str(self.naver_poster_cli),
-                "--dir", str(data_path),
-            ]
+            attempts = 3
+            auth_retry_done = False
+            last_error = "알 수 없는 오류"
+            last_payload: Optional[Dict[str, Any]] = None
+            last_stdout = ""
+            last_stderr = ""
 
-            self.logger.info(f"Executing naver-poster: {' '.join(cmd)}")
+            for attempt in range(1, attempts + 1):
+                cmd = self._build_naver_poster_command("--dir", str(data_path))
+                self.logger.info(
+                    "Executing naver-poster",
+                    extra={"attempt": attempt, "total_attempts": attempts, "dir": str(data_path)}
+                )
 
-            # 비동기 subprocess 실행
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=str(self.naver_poster_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    cwd=str(self.naver_poster_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+                stdout_str = stdout.decode('utf-8', errors='replace') if stdout else ""
+                stderr_str = stderr.decode('utf-8', errors='replace') if stderr else ""
+                report = self._extract_naver_post_report(stdout_str, stderr_str)
+
+                last_stdout = stdout_str
+                last_stderr = stderr_str
+                last_payload = report
+                last_error = stderr_str or stdout_str or "알 수 없는 오류"
+
+                draft_success = False
+                image_status = "unknown"
+                if report:
+                    draft_success = bool(report.get("draft_summary", {}).get("success"))
+                    image_status = str(report.get("image_summary", {}).get("status", "unknown"))
+                elif process.returncode == 0:
+                    draft_success = True
+                    image_status = "unknown"
+
+                # 임시저장 성공은 process returncode와 분리 판정
+                if draft_success:
+                    uploaded_count = int(report.get("image_summary", {}).get("uploaded_count", 0)) if report else 0
+                    missing_count = int(report.get("image_summary", {}).get("missing_count", 0)) if report else 0
+                    requested_count = int(report.get("image_summary", {}).get("requested_count", 0)) if report else 0
+                    image_refs = report.get("image_summary", {}).get("sample_refs", []) if report else []
+
+                    has_full_images = image_status in {"full", "not_requested"}
+                    has_partial_images = image_status == "partial"
+                    has_no_images = image_status == "none"
+
+                    message = "네이버 임시저장 완료"
+                    if has_partial_images:
+                        message = "네이버 임시저장 완료 (이미지 일부 누락)"
+                    elif has_no_images and requested_count > 0:
+                        message = "네이버 임시저장 완료 (텍스트만 저장됨)"
+
+                    self.logger.info(
+                        "Naver draft result",
+                        extra={
+                            "draft_success": draft_success,
+                            "image_status": image_status,
+                            "requested_count": requested_count,
+                            "uploaded_count": uploaded_count,
+                            "missing_count": missing_count,
+                            "attempt": attempt,
+                        },
+                    )
+
+                    return WorkflowStepResult(
+                        success=True,
+                        message=message,
+                        data={
+                            "success": True,
+                            "directory": date_directory,
+                            "upload_time": datetime.now().isoformat(),
+                            "draft_saved": True,
+                            "image_status": image_status,
+                            "image_requested_count": requested_count,
+                            "image_uploaded_count": uploaded_count,
+                            "image_missing_count": missing_count,
+                            "image_included_success": has_full_images,
+                            "image_partial": has_partial_images,
+                            "image_none": has_no_images,
+                            "image_refs_sample": image_refs,
+                            "pipeline_report": report,
+                            "output": stdout_str[-4000:],
+                            "stderr": stderr_str[-2000:] if stderr_str else None,
+                        }
+                    )
+
+                # 인증 실패 시 1회 자동 로그인 재시도
+                auth_error = self._is_authentication_error(stderr_str, stdout_str, report)
+                if auth_error and not auth_retry_done:
+                    auth_retry_done = True
+                    self.logger.warning("Authentication issue detected. Trying auto-login once before retry.")
+                    relogin_ok = await self._attempt_naver_relogin()
+                    if relogin_ok:
+                        continue
+
+                transient_error = self._is_transient_naver_failure(stderr_str, stdout_str, report)
+                if transient_error and attempt < attempts:
+                    wait_seconds = (2 ** (attempt - 1)) + random.uniform(0.2, 0.9)
+                    self.logger.warning(
+                        f"Transient naver upload failure (attempt {attempt}/{attempts}), "
+                        f"retrying in {wait_seconds:.2f}s"
+                    )
+                    await asyncio.sleep(wait_seconds)
+                    continue
+
+                break
+
+            self.logger.error(f"Naver upload failed: {last_error}")
+
+            # 실패 시 브라우저 세션 정리
+            await self._cleanup_browser_session()
+
+            # 에러 분류
+            error_code = self._classify_upload_error(last_stderr, last_stdout)
+            user_message = self._get_error_user_message(error_code, last_error[:500])
+
+            return WorkflowStepResult(
+                success=False,
+                message=user_message,
+                error=f"[{error_code}] 업로드 프로세스 실패: {last_error[:1000]}",
+                data={
+                    "pipeline_report": last_payload,
+                    "error_code": error_code,
+                    "output": last_stdout[-4000:] if last_stdout else "",
+                    "stderr": last_stderr[-2000:] if last_stderr else "",
+                }
             )
-
-            stdout, stderr = await process.communicate()
-
-            if process.returncode == 0:
-                self.logger.info(f"Naver upload successful for {date_directory}")
-
-                return WorkflowStepResult(
-                    success=True,
-                    message="네이버 임시저장 완료",
-                    data={
-                        "directory": date_directory,
-                        "output": stdout.decode('utf-8') if stdout else "",
-                        "upload_time": datetime.now().isoformat()
-                    }
-                )
-            else:
-                error_output = stderr.decode('utf-8') if stderr else "알 수 없는 오류"
-                self.logger.error(f"Naver upload failed: {error_output}")
-
-                # 실패 시 브라우저 세션 정리
-                await self._cleanup_browser_session()
-
-                return WorkflowStepResult(
-                    success=False,
-                    message="네이버 업로드 실패",
-                    error=f"업로드 프로세스 실패: {error_output}"
-                )
 
         except Exception as e:
             self.logger.error(f"Naver upload error: {e}")
@@ -544,11 +674,213 @@ class BlogWorkflowService:
             # 예외 발생 시에도 브라우저 세션 정리
             await self._cleanup_browser_session()
 
+            # 예외 에러도 분류
+            error_str = str(e)
+            error_code = self._classify_upload_error(error_str, "")
+            user_message = self._get_error_user_message(error_code, error_str[:500])
+
             return WorkflowStepResult(
                 success=False,
-                message="네이버 업로드 중 오류 발생",
-                error=str(e)
+                message=user_message,
+                error=f"[{error_code}] {error_str}"
             )
+
+    def _extract_naver_post_report(self, stdout: str, stderr: str) -> Optional[Dict[str, Any]]:
+        marker = "NAVER_POST_RESULT_JSON:"
+        for chunk in (stdout, stderr):
+            if marker not in chunk:
+                continue
+            for line in chunk.splitlines():
+                if marker not in line:
+                    continue
+                raw = line.split(marker, 1)[1].strip()
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except json.JSONDecodeError:
+                    continue
+        return None
+
+    def _is_authentication_error(
+        self,
+        stderr: str,
+        stdout: str,
+        report: Optional[Dict[str, Any]]
+    ) -> bool:
+        haystack = f"{stderr}\n{stdout}".lower()
+        auth_patterns = [
+            "login",
+            "로그인",
+            "인증",
+            "세션 만료",
+            "storage state",
+            "unauthorized",
+            "forbidden",
+        ]
+        if any(pattern in haystack for pattern in auth_patterns):
+            return True
+
+        if report:
+            step_f = report.get("steps", {}).get("F", {})
+            message = str(step_f.get("message", "")).lower()
+            if any(pattern in message for pattern in auth_patterns):
+                return True
+        return False
+
+    def _classify_upload_error(self, stderr: str, stdout: str) -> Optional[str]:
+        """업로드 에러를 환경/인증/네트워크/업로드 문제로 분류"""
+        haystack = f"{stderr}\n{stdout}".lower()
+
+        # ENV_NO_XSERVER: XServer 없음 + headed 실행 시도
+        xserver_patterns = [
+            "xserver", "xvfb", "env_no_xserver",
+            "headed browser without having a xserver",
+            "target page, context or browser has been closed",
+            "display", "headless: true",
+        ]
+        if any(p in haystack for p in xserver_patterns):
+            # "headless: true" 단독은 오탐 가능 → closed와 함께일 때만
+            if "browser has been closed" in haystack or "xserver" in haystack or "xvfb" in haystack or "env_no_xserver" in haystack:
+                return "ENV_NO_XSERVER"
+
+        # PLAYWRIGHT_LAUNCH_FAILED: 바이너리/권한/의존성
+        launch_patterns = ["browsertype.launch", "executable doesn't exist", "permission denied", "no usable sandbox"]
+        if any(p in haystack for p in launch_patterns):
+            return "PLAYWRIGHT_LAUNCH_FAILED"
+
+        # NAVER_AUTH_FAILED: 인증 문제
+        auth_patterns = ["login", "로그인", "인증", "세션 만료", "unauthorized", "forbidden"]
+        if any(p in haystack for p in auth_patterns):
+            return "NAVER_AUTH_FAILED"
+
+        # NAVER_RATE_LIMIT: 429
+        if "429" in haystack or "too many" in haystack or "rate limit" in haystack:
+            return "NAVER_RATE_LIMIT"
+
+        # NETWORK_DNS: DNS/네트워크
+        dns_patterns = ["dns", "resolve", "enotfound", "getaddrinfo"]
+        if any(p in haystack for p in dns_patterns):
+            return "NETWORK_DNS"
+
+        # NAVER_UPLOAD_FAILED: 일반 업로드 실패
+        return "NAVER_UPLOAD_FAILED"
+
+    def _get_error_user_message(self, error_code: str, raw_error: str) -> str:
+        """에러 코드에 따른 사용자 친화적 메시지 생성"""
+        messages = {
+            "ENV_NO_XSERVER": (
+                "❌ 네이버 임시저장 실패 (환경 설정 문제: XServer 없음)\n\n"
+                "원인: headed 모드(HEADLESS=false)로 실행했으나 XServer가 없습니다.\n"
+                "해결:\n"
+                "  1. HEADLESS=true로 실행 (권장)\n"
+                "  2. xvfb-run -a 로 실행\n"
+                "참고: docs/naver_temp_save_troubleshooting.md"
+            ),
+            "PLAYWRIGHT_LAUNCH_FAILED": (
+                "❌ 네이버 임시저장 실패 (브라우저 실행 오류)\n\n"
+                "원인: Playwright 브라우저 바이너리/권한/의존성 문제\n"
+                "해결: npx playwright install chromium 실행"
+            ),
+            "NAVER_AUTH_FAILED": (
+                "❌ 네이버 임시저장 실패 (로그인/세션 만료)\n\n"
+                "해결: 네이버 로그인 세션을 갱신하세요.\n"
+                "  node dist/cli/post_to_naver.js --autoLogin"
+            ),
+            "NAVER_RATE_LIMIT": (
+                "❌ 네이버 임시저장 실패 (요청 횟수 초과)\n\n"
+                "잠시 후 다시 시도해 주세요."
+            ),
+            "NETWORK_DNS": (
+                "❌ 네이버 임시저장 실패 (네트워크/DNS 오류)\n\n"
+                "인터넷 연결을 확인하세요."
+            ),
+            "NAVER_UPLOAD_FAILED": (
+                "❌ 네이버 임시저장 실패 (업로드 프로세스 오류)\n\n"
+                f"상세: {raw_error[:200]}\n"
+                "수동 업로드가 필요할 수 있습니다."
+            ),
+        }
+        return messages.get(error_code, f"❌ 네이버 임시저장 실패\n\n상세: {raw_error[:200]}")
+
+    def _is_transient_naver_failure(
+        self,
+        stderr: str,
+        stdout: str,
+        report: Optional[Dict[str, Any]]
+    ) -> bool:
+        haystack = f"{stderr}\n{stdout}".lower()
+        transient_patterns = [
+            "timeout",
+            "timed out",
+            "econnreset",
+            "econnrefused",
+            "network",
+            "429",
+            "503",
+            "502",
+            "500",
+            "temporar",
+        ]
+        if any(pattern in haystack for pattern in transient_patterns):
+            return True
+
+        if report:
+            step_c = report.get("steps", {}).get("C", {})
+            message = str(step_c.get("message", "")).lower()
+            if "simulated_timeout" in message:
+                return True
+
+            attempts = step_c.get("data", {}).get("attempts", [])
+            if isinstance(attempts, list):
+                for entry in attempts:
+                    if isinstance(entry, dict) and bool(entry.get("transient_failure")):
+                        return True
+
+        return False
+
+    async def _attempt_naver_relogin(self) -> bool:
+        try:
+            cmd = self._build_naver_poster_command("--autoLogin")
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(self.naver_poster_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            stdout_str = stdout.decode('utf-8', errors='replace') if stdout else ""
+            stderr_str = stderr.decode('utf-8', errors='replace') if stderr else ""
+
+            if process.returncode == 0:
+                self.logger.info("Auto-login succeeded before retry.")
+                return True
+
+            self.logger.warning(
+                "Auto-login failed",
+                extra={
+                    "returncode": process.returncode,
+                    "stdout": stdout_str[-800:],
+                    "stderr": stderr_str[-800:],
+                },
+            )
+            return False
+        except Exception as exc:
+            self.logger.warning(f"Auto-login attempt failed with exception: {exc}")
+            return False
+
+    def _build_naver_poster_command(self, *args: str) -> List[str]:
+        """
+        naver-poster 실행 커맨드 구성.
+        우선순위:
+        1) dist/cli/post_to_naver.js (빌드된 CLI)
+        2) npx --no-install tsx src/cli/post_to_naver.ts
+        """
+        dist_cli = self.naver_poster_path / "dist" / "cli" / "post_to_naver.js"
+        if dist_cli.exists():
+            return ["node", str(dist_cli), *args]
+
+        return ["npx", "--no-install", "tsx", str(self.naver_poster_cli), *args]
 
     async def _update_progress(
         self,
