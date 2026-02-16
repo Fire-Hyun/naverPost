@@ -326,4 +326,13 @@ class NaverPostTelegramBot(SafeMessageMixin):
         self.logger.info(f"Starting Telegram bot with token: {self.settings.TELEGRAM_BOT_TOKEN[:10]}...")
 
         # 봇 실행
-        application.run_polling(drop_pending_updates=True)
+        application.run_polling(
+            drop_pending_updates=True,
+            timeout=30,
+            read_timeout=30,
+            write_timeout=30,
+            connect_timeout=30,
+            pool_timeout=30,
+            close_loop=False,
+            stop_signals=None,
+        )

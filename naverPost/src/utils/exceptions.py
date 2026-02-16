@@ -178,6 +178,27 @@ class ConfigurationError(BlogSystemError):
             self.details = f"Missing keys: {', '.join(self.missing_keys)}"
 
 
+class EnvironmentConfigError(ConfigurationError):
+    """실행 환경 설정 오류 (XServer 없음, 브라우저 바이너리 등)"""
+
+    # 에러 코드 상수
+    ENV_NO_XSERVER = "ENV_NO_XSERVER"
+    PLAYWRIGHT_LAUNCH_FAILED = "PLAYWRIGHT_LAUNCH_FAILED"
+
+    def __init__(self, message: str, error_code: str = "", resolution: str = ""):
+        self.error_code = error_code
+        self.resolution = resolution
+        super().__init__(message)
+        self.step = "ENVIRONMENT"
+        details_parts = []
+        if error_code:
+            details_parts.append(f"Code: {error_code}")
+        if resolution:
+            details_parts.append(f"Resolution: {resolution}")
+        if details_parts:
+            self.details = ", ".join(details_parts)
+
+
 class NetworkTimeoutError(APIError):
     """네트워크 타임아웃 예외"""
 
@@ -213,3 +234,239 @@ class DataConsistencyError(BlogSystemError):
             details_parts.append(f"Actual: {actual}")
         if details_parts:
             self.details = ", ".join(details_parts)
+
+
+# === 안정화 관련 추가 예외 클래스 ===
+
+class ExternalServiceError(APIError):
+    """외부 서비스 호출 실패 기본 예외"""
+
+    def __init__(self, message: str, service_name: str = "", status_code: int = None,
+                 response_body: str = "", retry_count: int = 0):
+        self.service_name = service_name
+        self.response_body = response_body
+        self.retry_count = retry_count
+        super().__init__(message, service_name, status_code)
+        if response_body:
+            # 응답 본문이 너무 길면 잘라냄 (로깅용)
+            truncated_body = response_body[:200] + "..." if len(response_body) > 200 else response_body
+            self.details += f", Response: {truncated_body}"
+        if retry_count > 0:
+            self.details += f", Retries: {retry_count}"
+
+
+class RetryableError(ExternalServiceError):
+    """재시도 가능한 오류"""
+    pass
+
+
+class NonRetryableError(ExternalServiceError):
+    """재시도 불가능한 오류"""
+    pass
+
+
+class RateLimitError(RetryableError):
+    """레이트 리밋 예외"""
+
+    def __init__(self, message: str, service_name: str = "", retry_after: int = None):
+        self.retry_after = retry_after
+        super().__init__(message, service_name, 429)
+        if retry_after:
+            self.details += f", Retry-After: {retry_after}s"
+
+
+class CircuitBreakerError(ExternalServiceError):
+    """회로 차단기 작동 예외"""
+
+    def __init__(self, message: str, service_name: str = "", failure_count: int = 0):
+        self.failure_count = failure_count
+        super().__init__(message, service_name)
+        self.details += f", Failures: {failure_count}"
+
+
+class DNSResolutionError(NetworkTimeoutError):
+    """DNS 해결 실패 예외"""
+
+    def __init__(self, message: str, hostname: str = ""):
+        self.hostname = hostname
+        super().__init__(message, "DNS")
+        if hostname:
+            self.details = f"Hostname: {hostname}"
+
+
+class ConnectionError(RetryableError):
+    """연결 오류 예외"""
+
+    def __init__(self, message: str, service_name: str = "", endpoint: str = ""):
+        self.endpoint = endpoint
+        super().__init__(message, service_name)
+        if endpoint:
+            self.details += f", Endpoint: {endpoint}"
+
+
+class TimeoutError(RetryableError):
+    """타임아웃 예외"""
+
+    def __init__(self, message: str, service_name: str = "", timeout_type: str = "read",
+                 timeout_duration: float = None):
+        self.timeout_type = timeout_type  # connect, read, total
+        super().__init__(message, service_name)
+        details_parts = [f"Type: {timeout_type}"]
+        if timeout_duration:
+            details_parts.append(f"Duration: {timeout_duration}s")
+        self.details += f", {', '.join(details_parts)}"
+
+
+class ParseError(NonRetryableError):
+    """응답 파싱 오류"""
+
+    def __init__(self, message: str, service_name: str = "", response_format: str = ""):
+        self.response_format = response_format
+        super().__init__(message, service_name)
+        if response_format:
+            self.details += f", Format: {response_format}"
+
+
+class AuthExpiredError(NonRetryableError):
+    """인증 만료 예외 (재로그인 필요)"""
+
+    def __init__(self, message: str, service_name: str = ""):
+        super().__init__(message, service_name, 401)
+        self.details += ", Action: Re-authentication required"
+
+
+class ServiceUnavailableError(RetryableError):
+    """서비스 이용 불가 예외"""
+
+    def __init__(self, message: str, service_name: str = "", estimated_recovery: int = None):
+        self.estimated_recovery = estimated_recovery
+        super().__init__(message, service_name, 503)
+        if estimated_recovery:
+            self.details += f", Recovery: ~{estimated_recovery}s"
+
+
+class BadGatewayError(RetryableError):
+    """Bad Gateway 예외"""
+
+    def __init__(self, message: str, service_name: str = ""):
+        super().__init__(message, service_name, 502)
+
+
+class TooManyRequestsError(RateLimitError):
+    """요청 횟수 초과 예외"""
+
+    def __init__(self, message: str, service_name: str = "", window_seconds: int = None):
+        self.window_seconds = window_seconds
+        super().__init__(message, service_name)
+        if window_seconds:
+            self.details += f", Window: {window_seconds}s"
+
+
+# === 네이버 서비스별 특화 예외 ===
+
+class NaverMapAPIError(ExternalServiceError):
+    """네이버 지도 API 오류"""
+
+    def __init__(self, message: str, query: str = "", status_code: int = None,
+                 response_body: str = ""):
+        self.query = query
+        super().__init__(message, "NaverMap", status_code, response_body)
+        if query:
+            self.details += f", Query: {query}"
+
+
+class NaverBlogUploadError(ExternalServiceError):
+    """네이버 블로그 업로드 오류"""
+
+    def __init__(self, message: str, operation: str = "", blog_title: str = ""):
+        self.operation = operation
+        self.blog_title = blog_title
+        super().__init__(message, "NaverBlog")
+        details_parts = []
+        if operation:
+            details_parts.append(f"Operation: {operation}")
+        if blog_title:
+            details_parts.append(f"Title: {blog_title}")
+        if details_parts:
+            self.details += f", {', '.join(details_parts)}"
+
+
+class TelegramAPIError(ExternalServiceError):
+    """텔레그램 API 오류"""
+
+    def __init__(self, message: str, method: str = "", chat_id: str = ""):
+        self.method = method
+        self.chat_id = chat_id
+        super().__init__(message, "Telegram")
+        details_parts = []
+        if method:
+            details_parts.append(f"Method: {method}")
+        if chat_id:
+            details_parts.append(f"Chat: {chat_id}")
+        if details_parts:
+            self.details += f", {', '.join(details_parts)}"
+
+
+class ImageProcessingError(FileProcessingError):
+    """이미지 처리 오류"""
+
+    def __init__(self, message: str, file_path: str = "", operation: str = "",
+                 dimensions: tuple = None, file_size: int = None):
+        self.operation = operation
+        self.dimensions = dimensions
+        self.file_size = file_size
+        super().__init__(message, file_path)
+        details_parts = []
+        if operation:
+            details_parts.append(f"Operation: {operation}")
+        if dimensions:
+            details_parts.append(f"Size: {dimensions[0]}x{dimensions[1]}")
+        if file_size:
+            details_parts.append(f"FileSize: {file_size:,}B")
+        if details_parts:
+            self.details += f", {', '.join(details_parts)}"
+
+
+# === 예외 분류 헬퍼 함수 ===
+
+def classify_http_error(status_code: int, service_name: str = "", message: str = "",
+                       response_body: str = ""):
+    """HTTP 상태 코드를 기반으로 적절한 예외 클래스 반환"""
+
+    if status_code == 400:
+        return NonRetryableError(message or "Bad Request", service_name, status_code, response_body)
+    elif status_code == 401:
+        return AuthExpiredError(message or "Unauthorized", service_name)
+    elif status_code == 403:
+        return NonRetryableError(message or "Forbidden", service_name, status_code, response_body)
+    elif status_code == 404:
+        return NonRetryableError(message or "Not Found", service_name, status_code, response_body)
+    elif status_code == 429:
+        return RateLimitError(message or "Too Many Requests", service_name)
+    elif status_code == 500:
+        return RetryableError(message or "Internal Server Error", service_name, status_code, response_body)
+    elif status_code == 502:
+        return BadGatewayError(message or "Bad Gateway", service_name)
+    elif status_code == 503:
+        return ServiceUnavailableError(message or "Service Unavailable", service_name)
+    elif status_code == 504:
+        return TimeoutError(message or "Gateway Timeout", service_name, "gateway")
+    elif 400 <= status_code < 500:
+        return NonRetryableError(message or f"Client Error {status_code}", service_name, status_code, response_body)
+    elif 500 <= status_code < 600:
+        return RetryableError(message or f"Server Error {status_code}", service_name, status_code, response_body)
+    else:
+        return ExternalServiceError(message or f"HTTP Error {status_code}", service_name, status_code, response_body)
+
+
+def is_retryable_error(error: Exception) -> bool:
+    """예외가 재시도 가능한지 확인"""
+    return isinstance(error, (
+        RetryableError,
+        ConnectionError,
+        TimeoutError,
+        DNSResolutionError,
+        RateLimitError,
+        ServiceUnavailableError,
+        BadGatewayError
+    ))

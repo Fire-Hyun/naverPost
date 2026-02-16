@@ -37,7 +37,7 @@ except ImportError as e:
     print("Running in basic mode without full functionality")
     MODULES_AVAILABLE = False
 
-class TestPipelineRunner:
+class PipelineRunner:
     """테스트 파이프라인 실행 클래스"""
 
     def __init__(self, project_id: str):
@@ -431,7 +431,7 @@ def main():
     print(f"Phase 2 테스트 파이프라인 - 프로젝트 ID: {project_id}")
 
     # 파이프라인 실행
-    runner = TestPipelineRunner(project_id)
+    runner = PipelineRunner(project_id)
     runner.run_full_pipeline()
 
 

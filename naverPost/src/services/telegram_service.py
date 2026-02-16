@@ -9,6 +9,7 @@ import signal
 import socket
 import sys
 import time
+import threading
 from pathlib import Path
 from typing import Optional, Dict, Any, Callable
 
@@ -115,6 +116,10 @@ class TelegramBotService:
 
     def _setup_signal_handlers(self):
         """시그널 핸들러 설정"""
+        if threading.current_thread() is not threading.main_thread():
+            self.logger.info("Skipping signal handler install outside main thread")
+            return
+
         def signal_handler(signum, frame):
             signal_name = signal.Signals(signum).name
             self.logger.info(f"Received signal {signal_name}, requesting shutdown...")

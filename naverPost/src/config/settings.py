@@ -60,6 +60,11 @@ class Settings:
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
     try:
+        LOG_DIR: Path = Path(os.getenv("LOG_DIR", str(PROJECT_ROOT / "logs")))
+    except (ValueError, TypeError, OSError):
+        LOG_DIR: Path = PROJECT_ROOT / "logs"
+
+    try:
         LOG_FILE: Path = Path(os.getenv("LOG_FILE", str(PROJECT_ROOT / "logs" / "naverpost.log")))
     except (ValueError, TypeError, OSError):
         LOG_FILE: Path = PROJECT_ROOT / "logs" / "naverpost.log"
@@ -101,6 +106,9 @@ class Settings:
     SELENIUM_HEADLESS: bool = os.getenv("SELENIUM_HEADLESS", "true").lower() == "true"
     SELENIUM_IMPLICIT_WAIT: int = int(os.getenv("SELENIUM_IMPLICIT_WAIT", "10"))
     SELENIUM_PAGE_LOAD_TIMEOUT: int = int(os.getenv("SELENIUM_PAGE_LOAD_TIMEOUT", "30"))
+
+    # Playwright 설정 (기본 headless=true, 서버 환경 안전)
+    PLAYWRIGHT_HEADLESS: bool = os.getenv("PLAYWRIGHT_HEADLESS", os.getenv("HEADLESS", "true")).lower() == "true"
 
     # 자동화 안전성 설정
     POST_ACTION_DELAY: float = float(os.getenv("POST_ACTION_DELAY", "2.0"))  # 동작 간 지연 시간

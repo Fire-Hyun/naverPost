@@ -20,7 +20,7 @@ def main():
         # 통합된 Telegram 서비스 사용
         service = get_telegram_service(
             enable_dns_fallback=True,
-            retry_delay=10
+            base_retry_delay=10
         )
 
         return service.run()

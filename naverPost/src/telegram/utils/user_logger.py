@@ -95,9 +95,9 @@ class UserLogger:
         """상호명 입력 로그"""
         self.info(f"상호명 입력: {store_name}")
 
-    def log_store_name_resolved(self, original: str, resolved: str):
+    def log_store_name_resolved(self, raw_name: str, resolved_name: str):
         """상호명 보정 로그"""
-        self.info(f"상호명 보정 완료: '{original}' → '{resolved}'")
+        self.info(f"상호명 보정 완료: '{raw_name}' → '{resolved_name}'")
 
     def log_image_uploaded(self, count: int, filename: Optional[str] = None):
         """이미지 업로드 로그"""
@@ -106,9 +106,9 @@ class UserLogger:
             msg += f" - {filename}"
         self.info(msg)
 
-    def log_review_submitted(self, review_length: int):
+    def log_review_submitted(self, length: int):
         """감상평 제출 로그"""
-        self.info(f"감상평 입력 완료 ({review_length}자)")
+        self.info(f"감상평 입력 완료 ({length}자)")
 
     def log_additional_content(self, has_content: bool):
         """추가 내용 로그"""

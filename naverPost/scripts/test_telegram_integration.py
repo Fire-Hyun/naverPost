@@ -6,14 +6,21 @@ Test script for Telegram bot integration without external dependencies
 import sys
 import os
 from pathlib import Path
+import pytest
 
 # Add project root to path (scripts/ 아래로 이동했기 때문)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 os.chdir(PROJECT_ROOT)
 
+
+def _require_telegram_dependency():
+    """telegram 패키지가 없으면 관련 테스트를 건너뜁니다."""
+    pytest.importorskip("telegram", reason="python-telegram-bot dependency is not installed")
+
 def test_basic_imports():
     """Test imports that don't require telegram library"""
+    _require_telegram_dependency()
     try:
         # Test configuration
         from src.config.settings import Settings
@@ -34,16 +41,15 @@ def test_basic_imports():
         from src.telegram.config.telegram_settings import TelegramSettings
         print("✅ Telegram settings import successful")
 
-        return True
-
     except Exception as e:
         print(f"❌ Import error: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        raise AssertionError(f"Import test failed: {e}") from e
 
 def test_session_functionality():
     """Test session management functionality"""
+    _require_telegram_dependency()
     try:
         from src.telegram.models.session import TelegramSession, ConversationState, create_session
 
@@ -76,16 +82,15 @@ def test_session_functionality():
         assert "사진" in missing
         print("✅ Missing fields detection works")
 
-        return True
-
     except Exception as e:
         print(f"❌ Session functionality error: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        raise AssertionError(f"Session functionality test failed: {e}") from e
 
 def test_response_templates():
     """Test response template functionality"""
+    _require_telegram_dependency()
     try:
         from src.telegram.models.responses import ResponseTemplates
 
@@ -103,16 +108,15 @@ def test_response_templates():
         assert "카테고리" in missing_fields
         print("✅ Missing fields template works")
 
-        return True
-
     except Exception as e:
         print(f"❌ Response template error: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        raise AssertionError(f"Response template test failed: {e}") from e
 
 def test_configuration_validation():
     """Test configuration validation"""
+    _require_telegram_dependency()
     try:
         from src.telegram.config.telegram_settings import TelegramSettings
         from src.config.settings import Settings
@@ -128,16 +132,15 @@ def test_configuration_validation():
         assert "Telegram Bot Configuration" in info
         print("✅ Startup info generation works")
 
-        return True
-
     except Exception as e:
         print(f"❌ Configuration validation error: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        raise AssertionError(f"Configuration validation test failed: {e}") from e
 
 def test_existing_integration():
     """Test integration with existing system components"""
+    _require_telegram_dependency()
     try:
         # Test that we can import existing modules
         from src.storage.data_manager import data_manager
@@ -155,13 +158,11 @@ def test_existing_integration():
         assert hasattr(generator, 'generate_from_session_data')
         print("✅ Blog generator has required methods")
 
-        return True
-
     except Exception as e:
         print(f"❌ Existing integration error: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        raise AssertionError(f"Existing integration test failed: {e}") from e
 
 def main():
     """Run all tests"""
