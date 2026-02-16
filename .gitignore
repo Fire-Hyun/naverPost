@@ -130,9 +130,9 @@ dmypy.json
 
 # Project specific
 logs/
-data/posts/
-data/metadata/
-uploads/images/
+data/
+uploads/
+.secrets/
 *.tmp
 *.temp
 *.part
