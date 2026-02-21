@@ -134,6 +134,27 @@ class PostUploadError(NaverBlogError):
         self.details = ", ".join(details_parts)
 
 
+class SessionError(NaverBlogError):
+    """네이버 블로그 세션/페이지 오류 예외"""
+
+    def __init__(self, message: str, operation: str = "SESSION"):
+        super().__init__(message, operation)
+
+
+class EditorError(NaverBlogError):
+    """네이버 블로그 에디터 조작 오류 예외"""
+
+    def __init__(self, message: str, operation: str = "EDITOR"):
+        super().__init__(message, operation)
+
+
+class VerificationError(NaverBlogError):
+    """네이버 블로그 저장/업로드 검증 실패 예외"""
+
+    def __init__(self, message: str, operation: str = "VERIFY"):
+        super().__init__(message, operation)
+
+
 class ValidationRuleError(QualityValidationError):
     """품질 규칙 검증 실패 예외"""
 

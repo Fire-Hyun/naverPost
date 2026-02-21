@@ -10,7 +10,28 @@ export interface ParsedPost {
   imagePlaceholders: number[];
   /** body를 줄 단위로 분리한 배열 (플레이스홀더 포함) */
   bodyLines: string[];
+  /** 업로드 순서 제어를 위한 본문 블록 배열 */
+  blocks: PostBlock[];
   frontmatter: Record<string, string>;
+}
+
+export type PostBlock = TextBlock | ImageBlock | SectionTitleBlock;
+
+export interface TextBlock {
+  type: 'text';
+  content: string;
+}
+
+export interface SectionTitleBlock {
+  type: 'section_title';
+  content: string;
+}
+
+export interface ImageBlock {
+  type: 'image';
+  /** 1-based index, images[] 순번과 매핑 */
+  index: number;
+  marker?: string;
 }
 
 export interface PostMetadata {
@@ -22,6 +43,8 @@ export interface PostMetadata {
   hashtags?: string[];
   images?: string[];
   placeName?: string;
+  storeName?: string;
+  regionHint?: string;
   [key: string]: unknown;
 }
 
@@ -57,6 +80,8 @@ function parseFrontmatter(raw: string): { frontmatter: Record<string, string>; c
 // ────────────────────────────────────────────
 const PLACEHOLDER_PATTERNS = [
   /^\(사진\)$/,                      // (사진)
+  /^\(사진\d+\)$/,                  // (사진1)
+  /^\[사진\d+\]$/,                  // [사진1]
   /^!\[.*?\]\(.*?\)$/,              // ![alt](path)
   /^<!--\s*IMG:.*?-->$/,            // <!--IMG:xxx.jpg-->
 ];
@@ -74,50 +99,124 @@ function extractHashtags(text: string): string[] {
   return matches ?? [];
 }
 
-// ────────────────────────────────────────────
-// 제목 추출 전략
-// ────────────────────────────────────────────
-function extractTitle(
-  bodyLines: string[],
-  metadata: PostMetadata | null
-): { title: string; bodyStartIdx: number } {
-  // 전략 1: 첫 줄이 # 으로 시작
-  if (bodyLines.length > 0 && bodyLines[0].startsWith('# ')) {
-    return { title: bodyLines[0].slice(2).trim(), bodyStartIdx: 1 };
+function normalizeTextContent(content: string): string {
+  return content
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function normalizeTitleLine(line: string): string {
+  const trimmed = line.trim();
+  const withoutHeading = trimmed.replace(/^#\s+/, '');
+  const withoutTitlePrefix = withoutHeading.replace(/^title:\s*/i, '');
+  return withoutTitlePrefix.trim();
+}
+
+function resolveImageIndexFromToken(token: string): number | null {
+  const explicit = token.match(/(?:사진|photo)\s*(\d+)/i);
+  if (explicit) {
+    return Number(explicit[1]);
   }
 
-  // 전략 2: TITLE: 라인
-  for (let i = 0; i < Math.min(bodyLines.length, 5); i++) {
-    if (bodyLines[i].startsWith('TITLE:')) {
-      return { title: bodyLines[i].slice(6).trim(), bodyStartIdx: i + 1 };
-    }
+  const markdownAlt = token.match(/!\[[^\]]*?(\d+)[^\]]*\]\(.*?\)/i);
+  if (markdownAlt) {
+    return Number(markdownAlt[1]);
   }
 
-  // 전략 3: 메타데이터에서 해시태그/카테고리 기반 생성
-  if (metadata) {
-    const tags = metadata.hashtags ?? [];
-    // 해시태그에서 상호명 추출
-    for (const tag of tags) {
-      // "#장심도한국본점 #장심도" 같은 형태
-      const names = tag.match(/#([가-힣A-Za-z0-9_]+)/g);
-      if (names && names.length > 0) {
-        const placeName = names[0].replace('#', '');
-        const category = metadata.category ?? '';
-        if (category === '맛집') return { title: `${placeName} 방문 후기`, bodyStartIdx: 0 };
-        if (category === '카페') return { title: `${placeName} 카페 후기`, bodyStartIdx: 0 };
-        if (category === '호텔') return { title: `${placeName} 숙박 후기`, bodyStartIdx: 0 };
-        return { title: `${placeName} 후기`, bodyStartIdx: 0 };
+  const htmlComment = token.match(/IMG:[^\d]*(\d+)/i);
+  if (htmlComment) {
+    return Number(htmlComment[1]);
+  }
+
+  return null;
+}
+
+function normalizeSectionTitle(line: string): string | null {
+  const match = line.trim().match(/^\*\*(.+?)\*\*\s*$/);
+  if (!match) return null;
+  const title = match[1].trim();
+  if (!title) return null;
+  if (title.length < 2 || title.length > 20) return null;
+  if (/[.!?]/.test(title)) return null;
+  return title;
+}
+
+function pushTextWithQuote2Sections(content: string, blocks: PostBlock[]): void {
+  const normalized = normalizeTextContent(content);
+  if (normalized) {
+    blocks.push({ type: 'text', content: normalized });
+  }
+}
+
+function pushTextAndImages(content: string, blocks: PostBlock[], unnamedCounterRef: { value: number }): void {
+  const tokenPattern = /(\[사진\d+\]|\(사진\d+\)|\(사진\)|!\[[^\]]*?\]\([^)]+\)|<!--\s*IMG:.*?-->)/gi;
+  let lastIndex = 0;
+  for (const match of content.matchAll(tokenPattern)) {
+    const token = match[0];
+    const start = match.index ?? 0;
+    const before = content.slice(lastIndex, start);
+    pushTextWithQuote2Sections(before, blocks);
+    const explicitIndex = resolveImageIndexFromToken(token);
+    const imageIndex = explicitIndex && explicitIndex > 0 ? explicitIndex : unnamedCounterRef.value++;
+    blocks.push({ type: 'image', index: imageIndex, marker: token });
+    lastIndex = start + token.length;
+  }
+  pushTextWithQuote2Sections(content.slice(lastIndex), blocks);
+}
+
+function buildBlocks(rawBody: string): PostBlock[] {
+  const blocks: PostBlock[] = [];
+  const unnamedCounterRef = { value: 1 };
+
+  // **소제목** 라인을 section_title로 보존하고, 나머지 라인은 기존 텍스트/이미지 토큰 파싱 적용
+  const lines = rawBody.split('\n');
+  let textBuffer: string[] = [];
+  for (const line of lines) {
+    const maybeHeading = normalizeSectionTitle(line);
+    if (maybeHeading) {
+      const buffered = normalizeTextContent(textBuffer.join('\n'));
+      if (buffered) {
+        pushTextAndImages(buffered, blocks, unnamedCounterRef);
       }
+      textBuffer = [];
+      blocks.push({ type: 'section_title', content: maybeHeading });
+      continue;
     }
+    textBuffer.push(line);
   }
 
-  // 전략 4: 첫 줄이 짧으면 제목으로 사용
-  if (bodyLines.length > 0 && bodyLines[0].trim().length > 0 && bodyLines[0].trim().length <= 40) {
-    return { title: bodyLines[0].trim(), bodyStartIdx: 1 };
+  const bufferedTail = normalizeTextContent(textBuffer.join('\n'));
+  if (bufferedTail) {
+    pushTextAndImages(bufferedTail, blocks, unnamedCounterRef);
   }
 
-  // 전략 5: 최후 - 날짜 기반
-  return { title: '블로그 포스팅', bodyStartIdx: 0 };
+  if (blocks.length === 0 && normalizeTextContent(rawBody)) {
+    blocks.push({ type: 'text', content: normalizeTextContent(rawBody) });
+  }
+
+  return blocks;
+}
+
+function extractMarkdownImagePaths(markdown: string): string[] {
+  const paths: string[] = [];
+  const markdownPattern = /!\[[^\]]*?\]\(([^)]+)\)/g;
+  for (const match of markdown.matchAll(markdownPattern)) {
+    const rawPath = (match[1] || '').trim().replace(/^["']|["']$/g, '');
+    if (!rawPath) continue;
+    if (/^(https?:|data:|blob:)/i.test(rawPath)) continue;
+    paths.push(rawPath);
+  }
+
+  const htmlPattern = /<img[^>]*src=["']([^"']+)["'][^>]*>/gi;
+  for (const match of markdown.matchAll(htmlPattern)) {
+    const rawPath = (match[1] || '').trim();
+    if (!rawPath) continue;
+    if (/^(https?:|data:|blob:)/i.test(rawPath)) continue;
+    paths.push(rawPath);
+  }
+
+  return paths;
 }
 
 // ────────────────────────────────────────────
@@ -127,42 +226,41 @@ export function parseBlogResult(filePath: string, metadata: PostMetadata | null 
   const raw = fs.readFileSync(filePath, 'utf-8');
   const { frontmatter, content } = parseFrontmatter(raw);
 
-  // 빈 줄 제거하지 않고 줄 단위로 분리
-  const allLines = content.split('\n');
+  const allLines = content
+    .split('\n')
+    .filter((line, idx) => !(idx <= 2 && /^\s*<!--\s*RUN_ID:\s*[A-Za-z0-9_\-]+\s*-->\s*$/.test(line.trim())));
+  const titleLineIndex = allLines.findIndex((line) => line.trim().length > 0);
+  const title = titleLineIndex >= 0 ? normalizeTitleLine(allLines[titleLineIndex]) : '블로그 포스팅';
 
-  // 앞뒤 빈 줄 제거
-  let startIdx = 0;
-  while (startIdx < allLines.length && allLines[startIdx].trim() === '') startIdx++;
-  let endIdx = allLines.length - 1;
-  while (endIdx >= 0 && allLines[endIdx].trim() === '') endIdx--;
-  const trimmedLines = allLines.slice(startIdx, endIdx + 1);
+  // 제목 줄 이후가 본문(원문 순서 유지)
+  const bodyLines = titleLineIndex >= 0 ? allLines.slice(titleLineIndex + 1) : [];
 
-  // 마지막 줄에서 해시태그 분리
+  // 마지막 줄 해시태그 분리
   let hashtagLine = '';
-  const contentLines = [...trimmedLines];
-  if (contentLines.length > 0) {
-    const lastLine = contentLines[contentLines.length - 1].trim();
+  let lastNonEmptyIndex = -1;
+  for (let i = bodyLines.length - 1; i >= 0; i--) {
+    if (bodyLines[i].trim().length > 0) {
+      lastNonEmptyIndex = i;
+      break;
+    }
+  }
+  if (lastNonEmptyIndex >= 0) {
+    const lastLine = bodyLines[lastNonEmptyIndex].trim();
     if (lastLine.startsWith('#') && extractHashtags(lastLine).length > 0) {
-      hashtagLine = contentLines.pop()!;
+      hashtagLine = bodyLines[lastNonEmptyIndex];
+      bodyLines.splice(lastNonEmptyIndex, 1);
     }
   }
 
-  // 제목 추출
-  const { title, bodyStartIdx } = extractTitle(contentLines, metadata);
-  const bodyLines = contentLines.slice(bodyStartIdx);
-
-  // 이미지 플레이스홀더 위치 찾기
-  const imagePlaceholders: number[] = [];
-  bodyLines.forEach((line, idx) => {
-    if (isImagePlaceholder(line)) {
-      imagePlaceholders.push(idx);
-    }
-  });
-
   const hashtags = extractHashtags(hashtagLine);
   const body = bodyLines.join('\n').trim();
+  const blocks = buildBlocks(body);
+  const imagePlaceholders = blocks
+    .map((block, idx) => ({ block, idx }))
+    .filter((entry) => entry.block.type === 'image')
+    .map((entry) => entry.idx);
 
-  return { title, body, hashtags, imagePlaceholders, bodyLines, frontmatter };
+  return { title, body, hashtags, imagePlaceholders, bodyLines, blocks, frontmatter };
 }
 
 // ────────────────────────────────────────────
@@ -184,6 +282,8 @@ export function loadMetadata(dirPath: string): PostMetadata | null {
       hashtags: userInput.hashtags,
       images: raw.images,
       placeName: userInput.place_name ?? userInput.store_name,
+      storeName: userInput.store_name,
+      regionHint: userInput.region_hint ?? userInput.region ?? userInput.location_hint,
     };
   } catch (e) {
     log.warn(`metadata.json 파싱 실패: ${e}`);
@@ -208,17 +308,50 @@ export function loadPostDirectory(dirPath: string): PostDirectory {
 
   const imagesDir = path.join(absDir, 'images');
   const metadataPath = path.join(absDir, 'metadata.json');
+  const metadata = loadMetadata(absDir);
 
-  // 이미지 파일 목록
+  // 이미지 파일 목록 (markdown 경로 우선 + images 디렉토리 보강)
   let imagePaths: string[] = [];
+  const resolveImageCandidate = (rawPath: string): string => {
+    if (path.isAbsolute(rawPath)) return path.resolve(rawPath);
+    const fromRoot = path.resolve(absDir, rawPath);
+    if (fs.existsSync(fromRoot)) return fromRoot;
+    const fromImagesDir = path.resolve(imagesDir, path.basename(rawPath));
+    if (fs.existsSync(fromImagesDir)) return fromImagesDir;
+    return fromRoot;
+  };
+
+  const markdownRaw = fs.readFileSync(blogResultPath, 'utf-8');
+  const markdownImagePaths = extractMarkdownImagePaths(markdownRaw).map((p) => resolveImageCandidate(p));
+  const orderedUnique: string[] = [];
+  const seen = new Set<string>();
+  const pushOrdered = (candidate: string) => {
+    const resolved = path.resolve(candidate);
+    if (seen.has(resolved)) return;
+    seen.add(resolved);
+    orderedUnique.push(resolved);
+  };
+  for (const p of markdownImagePaths) {
+    pushOrdered(p);
+  }
+
+  const metadataImages = Array.isArray(metadata?.images) ? metadata.images : [];
+  for (const raw of metadataImages) {
+    if (typeof raw !== 'string' || !raw.trim()) continue;
+    pushOrdered(resolveImageCandidate(raw));
+  }
+
   if (fs.existsSync(imagesDir)) {
-    imagePaths = fs.readdirSync(imagesDir)
+    const fromImageDir = fs.readdirSync(imagesDir)
       .filter((f) => /\.(jpe?g|png|gif|webp|bmp)$/i.test(f))
       .sort()
       .map((f) => path.join(imagesDir, f));
+    for (const p of fromImageDir) {
+      pushOrdered(p);
+    }
   }
+  imagePaths = orderedUnique;
 
-  const metadata = loadMetadata(absDir);
   const parsed = parseBlogResult(blogResultPath, metadata);
 
   log.info(`포스트 로드 완료: ${path.basename(absDir)}`);
@@ -227,6 +360,11 @@ export function loadPostDirectory(dirPath: string): PostDirectory {
   log.info(`  해시태그: ${parsed.hashtags.length}개`);
   log.info(`  이미지: ${imagePaths.length}장`);
   log.info(`  플레이스홀더: ${parsed.imagePlaceholders.length}개`);
+  for (const [idx, imagePath] of imagePaths.entries()) {
+    const exists = fs.existsSync(imagePath);
+    const size = exists ? fs.statSync(imagePath).size : 0;
+    log.info(`  이미지경로[${idx + 1}] exists=${exists} size=${size} path=${imagePath}`);
+  }
 
   return { dirPath: absDir, blogResultPath, imagesDir, metadataPath, imagePaths, metadata, parsed };
 }

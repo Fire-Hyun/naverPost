@@ -14,8 +14,10 @@ from telegram.ext import (
 from src.config.settings import Settings
 
 from .models.session import (
-    TelegramSession, ConversationState, active_sessions,
-    get_session, create_session, delete_session
+    TelegramSession, ConversationState,
+    create_session, delete_session,
+    resolve_session_for_request, account_session_lock,
+    update_session,
 )
 from .models.responses import ResponseTemplates
 from .handlers.conversation import ConversationHandler as TelegramConversationHandler
@@ -117,19 +119,27 @@ class NaverPostTelegramBot(SafeMessageMixin):
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """/start 명령어 - 새 세션 초기화"""
         user_id = update.effective_user.id
+        request_id = self._request_id(update)
+        chat_id = update.effective_chat.id if update.effective_chat else None
 
         # 보안 확인
         if not AccessControl.is_user_allowed(user_id, self.settings):
             await update.message.reply_text(self.responses.access_denied())
             return
 
-        # 기존 세션 정리
-        if user_id in active_sessions:
-            self.session_service.cleanup_user_session(user_id)
+        async with account_session_lock(user_id, request_id):
+            # 기존 세션 정리
+            await self.session_service.cleanup_user_session(user_id)
 
-        # 새 세션 생성
-        session = create_session(user_id)
-        self.logger.info(f"New session created for user {user_id}")
+            # 새 세션 생성
+            session = create_session(user_id)
+            update_session(session)
+            self.logger.info(
+                "New session created accountId=%s chatId=%s requestId=%s",
+                user_id,
+                chat_id,
+                request_id,
+            )
 
         # 사용자별 로깅
         user_logger = get_user_logger(user_id)
@@ -143,45 +153,65 @@ class NaverPostTelegramBot(SafeMessageMixin):
 
     async def done_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """/done 명령어 - 블로그 생성 실행"""
-        session = await SessionValidator.validate_and_get_session(update, context)
-        if not session:
-            return
+        user_id = update.effective_user.id
+        request_id = self._request_id(update)
+        async with account_session_lock(user_id, request_id):
+            session = await SessionValidator.validate_and_get_session(update, context)
+            if not session:
+                return
 
-        # 세션 검증 및 블로그 생성
-        if await self.session_service.validate_session_for_generation(update, session):
-            await self.blog_service.generate_blog_from_session(update, session)
+            # 세션 검증 및 블로그 생성
+            if await self.session_service.validate_session_for_generation(update, session):
+                await self.blog_service.generate_blog_from_session(update.message, session)
 
     async def cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """/cancel 명령어 - 현재 세션 취소"""
         user_id = update.effective_user.id
-        session = get_session(user_id)
+        request_id = self._request_id(update)
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        async with account_session_lock(user_id, request_id):
+            session, _, _ = resolve_session_for_request(
+                account_id=user_id,
+                chat_id=chat_id,
+                request_id=request_id,
+                require_existing=True,
+            )
 
-        if session:
-            # 사용자별 로깅
-            user_logger = get_user_logger(user_id)
-            user_logger.log_session_cancel()
+            if session:
+                # 사용자별 로깅
+                user_logger = get_user_logger(user_id)
+                user_logger.log_session_cancel()
 
-            self.image_handler.cleanup_temp_files(user_id)
-            delete_session(user_id)
-            await update.message.reply_text(self.responses.session_canceled())
-        else:
-            await update.message.reply_text(self.responses.no_active_session())
+                await self.image_handler.cleanup_temp_files(user_id)
+                delete_session(user_id)
+                await update.message.reply_text(self.responses.session_canceled())
+            else:
+                await update.message.reply_text(self.responses.no_active_session())
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """/status 명령어 - 현재 진행 상태 확인"""
         user_id = update.effective_user.id
-        session = get_session(user_id)
+        request_id = self._request_id(update)
+        chat_id = update.effective_chat.id if update.effective_chat else None
 
-        if not session:
-            await update.message.reply_text(self.responses.no_active_session())
-            return
+        async with account_session_lock(user_id, request_id):
+            session, _, _ = resolve_session_for_request(
+                account_id=user_id,
+                chat_id=chat_id,
+                request_id=request_id,
+                require_existing=True,
+            )
 
-        summary = session.get_progress_summary()
-        missing_fields = session.get_missing_fields()
+            if not session:
+                await update.message.reply_text(self.responses.no_active_session())
+                return
 
-        await update.message.reply_text(
-            self.responses.status_message(summary, missing_fields)
-        )
+            summary = session.get_progress_summary()
+            missing_fields = session.get_missing_fields()
+
+            await update.message.reply_text(
+                self.responses.status_message(summary, missing_fields)
+            )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """/help 명령어 - 도움말"""
@@ -233,70 +263,114 @@ class NaverPostTelegramBot(SafeMessageMixin):
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """텍스트 메시지를 대화 핸들러로 라우팅"""
-        session = await SessionValidator.validate_and_get_session(update, context)
-        if not session:
+        user_id = update.effective_user.id
+        request_id = self._request_id(update)
+
+        # 보안 확인
+        if not AccessControl.is_user_allowed(user_id, self.settings):
+            await update.message.reply_text(self.responses.access_denied())
             return
 
-        await self.conversation_handler.handle_message(update, context, session)
+        async with account_session_lock(user_id, request_id):
+            session = await SessionValidator.validate_and_get_session(update, context)
+            if not session:
+                return
+
+            await self.conversation_handler.handle_message(update, context, session)
 
     async def handle_image(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """이미지 메시지를 이미지 핸들러로 라우팅"""
-        session = await SessionValidator.validate_and_get_session(update, context)
-        if not session:
-            return
+        user_id = update.effective_user.id
+        request_id = self._request_id(update)
+        async with account_session_lock(user_id, request_id):
+            session = await SessionValidator.validate_and_get_session(update, context)
+            if not session:
+                return
 
-        await self.image_handler.handle_image(update, context, session)
+            await self.image_handler.handle_image(update, context, session)
 
     async def handle_location(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """위치 메시지를 대화 핸들러로 라우팅"""
-        session = await SessionValidator.validate_and_get_session(update, context)
-        if not session:
-            return
+        user_id = update.effective_user.id
+        request_id = self._request_id(update)
+        async with account_session_lock(user_id, request_id):
+            session = await SessionValidator.validate_and_get_session(update, context)
+            if not session:
+                return
 
-        await self.conversation_handler.handle_location(update, context, session)
+            await self.conversation_handler.handle_location(update, context, session)
 
     async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """버튼 클릭 (CallbackQuery) 메시지를 대화 핸들러로 라우팅"""
         user_id = update.effective_user.id
+        request_id = self._request_id(update)
+        chat_id = update.effective_chat.id if update.effective_chat else None
 
         # 보안 확인
         if not AccessControl.is_user_allowed(user_id, self.settings):
             await update.callback_query.answer("접근 권한이 없습니다.", show_alert=True)
             return
 
-        # 세션 검증 - CallbackQuery용
-        session = get_session(user_id)
-
-        # 특별한 콜백들은 세션이 없어도 허용 (시작/도움말/취소)
-        allowed_without_session = [ACTION_START, ACTION_HELP, ACTION_CANCEL_CURRENT, 'start_new_blog']
-
-        if not session and update.callback_query.data not in allowed_without_session:
-            await update.callback_query.answer()
-            await update.callback_query.edit_message_text(
-                self.responses.no_active_session(),
-                reply_markup=self.responses.create_start_keyboard()
+        async with account_session_lock(user_id, request_id):
+            # 세션 검증 - CallbackQuery용
+            session, reason_code, debug_path = resolve_session_for_request(
+                account_id=user_id,
+                chat_id=chat_id,
+                request_id=request_id,
+                require_existing=True,
             )
-            return
 
-        # 세션이 있는 경우 만료 확인
-        if session and session.is_expired(DEFAULT_SESSION_TIMEOUT):
-            delete_session(user_id)
-            await update.callback_query.answer()
-            await update.callback_query.edit_message_text(
-                self.responses.session_expired(),
-                reply_markup=self.responses.create_start_keyboard()
-            )
-            return
+            # 특별한 콜백들은 세션이 없어도 허용 (시작/도움말/취소)
+            allowed_without_session = [ACTION_START, ACTION_HELP, ACTION_CANCEL_CURRENT, 'start_new_blog']
 
-        # 새 세션이 필요한 경우 생성 (start_new_blog)
-        if not session and update.callback_query.data in allowed_without_session:
-            session = create_session(user_id)
+            if not session and update.callback_query.data not in allowed_without_session:
+                self.logger.error(
+                    "ACTIVE_SESSION_MISSING reason_code=%s accountId=%s requestId=%s debugPath=%s",
+                    reason_code,
+                    user_id,
+                    request_id,
+                    debug_path or "-",
+                )
+                await update.callback_query.answer()
+                await update.callback_query.edit_message_text(
+                    self.responses.no_active_session(),
+                    reply_markup=self.responses.create_start_keyboard()
+                )
+                return
 
-        await self.conversation_handler.handle_callback_query(update, context, session)
+            # 세션이 있는 경우 만료 확인
+            if session and session.is_expired(DEFAULT_SESSION_TIMEOUT):
+                delete_session(user_id)
+                await update.callback_query.answer()
+                await update.callback_query.edit_message_text(
+                    self.responses.session_expired(),
+                    reply_markup=self.responses.create_start_keyboard()
+                )
+                return
+
+            # 새 세션이 필요한 경우 생성 (start_new_blog)
+            if not session and update.callback_query.data in allowed_without_session:
+                session = create_session(user_id)
+                update_session(session)
+
+            await self.conversation_handler.handle_callback_query(update, context, session)
 
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """에러 핸들러"""
-        self.logger.error(f"Exception while handling update: {context.error}")
+        """에러 핸들러 - full traceback 로깅"""
+        self.logger.error(
+            f"Exception while handling update: {context.error}",
+            exc_info=context.error,
+        )
+
+        # 사용자별 로깅 (추적 가능하도록)
+        if update and update.effective_user:
+            try:
+                user_logger = get_user_logger(update.effective_user.id)
+                user_logger.error(
+                    f"[ERROR_HANDLER] {type(context.error).__name__}: {context.error}"
+                )
+            except Exception:
+                pass
 
         # 사용자에게 에러 메시지 전송 (업데이트가 있는 경우만)
         if update and update.effective_message:
@@ -336,3 +410,7 @@ class NaverPostTelegramBot(SafeMessageMixin):
             close_loop=False,
             stop_signals=None,
         )
+
+    @staticmethod
+    def _request_id(update: Update) -> str:
+        return f"upd-{getattr(update, 'update_id', 'na')}"

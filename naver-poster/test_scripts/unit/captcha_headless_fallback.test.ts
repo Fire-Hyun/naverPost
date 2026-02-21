@@ -8,7 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { backupInvalidStorageState } from '../../src/naver/session';
 import { WorkerService, WorkerConfig } from '../../src/worker/worker_service';
-import { WorkerJob, SessionValidationResult, FailureReasonCode } from '../../src/worker/types';
+import { WorkerJob, FailureReasonCode } from '../../src/worker/types';
 
 // ────────────────────────────────────────────────────────────────
 // T1: headless 결정 우선순위 테스트 (코드 정적 분석 기반)
@@ -50,13 +50,15 @@ describe('T1: headless 결정 우선순위', () => {
     expect(serviceSrc).toContain("'--headless'");
   });
 
-  test('worker_service.ts: interactiveLogin fallback은 HEADLESS=false로 실행', () => {
+  test('worker_service.ts: interactiveLogin fallback이 제거되어 있다 (Login Policy v2)', () => {
     const serviceSrc = fs.readFileSync(
       path.resolve(__dirname, '../../src/worker/worker_service.ts'),
       'utf-8',
     );
-    expect(serviceSrc).toContain("HEADLESS: 'false'");
-    expect(serviceSrc).toContain('--interactiveLogin');
+    // interactiveLogin fallback 메서드가 없어야 함
+    expect(serviceSrc).not.toContain('attemptInteractiveLoginFallback');
+    // 즉시 BLOCKED_LOGIN 전환 안내 포함
+    expect(serviceSrc).toContain('즉시 BLOCKED_LOGIN');
   });
 });
 
@@ -80,7 +82,6 @@ function makeJob(overrides: Partial<WorkerJob> = {}): WorkerJob {
 
 type MockDeps = {
   executeUploadJob: jest.Mock;
-  validateSession: jest.Mock;
   notifyAdmin: jest.Mock;
   notifyUser: jest.Mock;
 };
@@ -88,7 +89,6 @@ type MockDeps = {
 function makeMockDeps(overrides: Partial<MockDeps> = {}): MockDeps {
   return {
     executeUploadJob: jest.fn().mockResolvedValue({ ok: true, detail: 'ok', stdout: '', stderr: '' }),
-    validateSession: jest.fn().mockResolvedValue({ ok: true, detail: 'ok' } as SessionValidationResult),
     notifyAdmin: jest.fn().mockResolvedValue(undefined),
     notifyUser: jest.fn().mockResolvedValue(undefined),
     ...overrides,
@@ -101,8 +101,8 @@ const baseConfig: WorkerConfig = {
   resume: false,
 };
 
-describe('T2: CAPTCHA fallback 플로우', () => {
-  test('1차 CAPTCHA, DISPLAY 없음 → fallback 실패 → BLOCKED_LOGIN + CAPTCHA 안내 메시지', async () => {
+describe('T2: CAPTCHA 즉시 차단 플로우 (Login Policy v2)', () => {
+  test('CAPTCHA 감지 → fallback 없이 즉시 BLOCKED_LOGIN + 운영자 알림', async () => {
     const captchaResult = {
       ok: false,
       reasonCode: 'SECURITY_CHALLENGE' as FailureReasonCode,
@@ -114,30 +114,23 @@ describe('T2: CAPTCHA fallback 플로우', () => {
       executeUploadJob: jest.fn().mockResolvedValue(captchaResult),
     });
 
-    // DISPLAY를 일시 제거하여 attemptInteractiveLoginFallback이 즉시 false 반환
-    const savedDisplay = process.env.DISPLAY;
-    delete process.env.DISPLAY;
-    try {
-      const tmpQueue = path.resolve('/tmp', `test_queue_${Date.now()}.json`);
-      fs.writeFileSync(tmpQueue, JSON.stringify({ version: 1, jobs: [makeJob({ status: 'PENDING' })] }, null, 2));
+    const tmpQueue = path.resolve('/tmp', `test_queue_${Date.now()}.json`);
+    fs.writeFileSync(tmpQueue, JSON.stringify({ version: 1, jobs: [makeJob({ status: 'PENDING' })] }, null, 2));
 
-      const service = new WorkerService({ ...baseConfig, queuePath: tmpQueue }, deps);
-      await service.processNextJob();
+    const service = new WorkerService({ ...baseConfig, queuePath: tmpQueue }, deps);
+    await service.processNextJob();
 
-      // notifyUser가 CAPTCHA 관련 메시지를 포함하여 호출되어야 함
-      expect(deps.notifyUser).toHaveBeenCalledWith(
-        'chat-123',
-        expect.stringContaining('CAPTCHA'),
-      );
-      // BLOCKED_LOGIN이므로 notifyAdmin도 호출되어야 함
-      expect(deps.notifyAdmin).toHaveBeenCalled();
-      fs.rmSync(tmpQueue, { force: true });
-    } finally {
-      if (savedDisplay !== undefined) process.env.DISPLAY = savedDisplay;
-    }
+    // 즉시 BLOCKED_LOGIN → notifyAdmin 호출
+    expect(deps.notifyAdmin).toHaveBeenCalled();
+    // notifyUser는 BLOCKED_LOGIN 안내 메시지
+    expect(deps.notifyUser).toHaveBeenCalledWith(
+      'chat-123',
+      expect.stringContaining('BLOCKED_LOGIN'),
+    );
+    fs.rmSync(tmpQueue, { force: true });
   });
 
-  test('captchaFallbackAttempted=true인 job이 또 CAPTCHA면 BLOCKED_LOGIN 처리 (무한 루프 방지)', async () => {
+  test('captchaFallbackAttempted=true인 job도 동일하게 즉시 BLOCKED_LOGIN', async () => {
     const captchaResult = {
       ok: false,
       reasonCode: 'SECURITY_CHALLENGE' as FailureReasonCode,
@@ -156,13 +149,12 @@ describe('T2: CAPTCHA fallback 플로우', () => {
     const service = new WorkerService({ ...baseConfig, queuePath: tmpQueue }, deps);
     await service.processNextJob();
 
-    // 무한 루프 방지: "CAPTCHA 반복" 메시지가 전송되어야 함
+    // fallback 없이 즉시 BLOCKED_LOGIN
+    expect(deps.notifyAdmin).toHaveBeenCalled();
     expect(deps.notifyUser).toHaveBeenCalledWith(
       'chat-123',
-      expect.stringContaining('CAPTCHA 반복'),
+      expect.stringContaining('BLOCKED_LOGIN'),
     );
-    // notifyAdmin도 BLOCKED_LOGIN 안내 전송 확인
-    expect(deps.notifyAdmin).toHaveBeenCalled();
     fs.rmSync(tmpQueue, { force: true });
   });
 
@@ -189,52 +181,20 @@ describe('T2: CAPTCHA fallback 플로우', () => {
 });
 
 // ────────────────────────────────────────────────────────────────
-// T3: 세션 없으면 업로드 진입 금지 테스트
+// T3: 단일 세션 오너 모델 - validateSession 게이트 제거 검증
 // ────────────────────────────────────────────────────────────────
-describe('T3: 세션 검증 실패 시 업로드 진입 금지', () => {
-  test('validateSession이 SESSION_EXPIRED이면 executeUploadJob이 호출되지 않음', async () => {
-    const deps = makeMockDeps({
-      validateSession: jest.fn().mockResolvedValue({
-        ok: false,
-        reasonCode: 'SESSION_EXPIRED' as FailureReasonCode,
-        detail: '세션 만료',
-      } as SessionValidationResult),
-    });
-
-    const tmpQueue = path.resolve('/tmp', `test_queue_${Date.now()}.json`);
-    fs.writeFileSync(tmpQueue, JSON.stringify({ version: 1, jobs: [makeJob({ status: 'PENDING' })] }, null, 2));
-
-    const service = new WorkerService({ ...baseConfig, queuePath: tmpQueue }, deps);
-    await service.processNextJob();
-
-    // 세션이 없으면 업로드(executeUploadJob)가 절대 호출되면 안 됨
-    expect(deps.executeUploadJob).not.toHaveBeenCalled();
-    // BLOCKED_LOGIN 안내가 전송되어야 함
-    expect(deps.notifyAdmin).toHaveBeenCalled();
-    fs.rmSync(tmpQueue, { force: true });
+describe('T3: 단일 세션 오너 모델 (validateSession 게이트 제거)', () => {
+  test('WorkerDependencies에 validateSession이 없다 (정적 분석)', () => {
+    const serviceSrc = fs.readFileSync(
+      path.resolve(__dirname, '../../src/worker/worker_service.ts'),
+      'utf-8',
+    );
+    // WorkerDependencies 타입 블록에 validateSession이 없어야 함
+    const depTypeBlock = serviceSrc.match(/type WorkerDependencies\s*=\s*\{[^}]*\}/s)?.[0] ?? '';
+    expect(depTypeBlock).not.toContain('validateSession');
   });
 
-  test('validateSession이 SECURITY_CHALLENGE이면 executeUploadJob이 호출되지 않음', async () => {
-    const deps = makeMockDeps({
-      validateSession: jest.fn().mockResolvedValue({
-        ok: false,
-        reasonCode: 'SECURITY_CHALLENGE' as FailureReasonCode,
-        detail: 'CAPTCHA',
-      } as SessionValidationResult),
-    });
-
-    const tmpQueue = path.resolve('/tmp', `test_queue_${Date.now()}.json`);
-    fs.writeFileSync(tmpQueue, JSON.stringify({ version: 1, jobs: [makeJob({ status: 'PENDING' })] }, null, 2));
-
-    const service = new WorkerService({ ...baseConfig, queuePath: tmpQueue }, deps);
-    await service.processNextJob();
-
-    expect(deps.executeUploadJob).not.toHaveBeenCalled();
-    expect(deps.notifyAdmin).toHaveBeenCalled();
-    fs.rmSync(tmpQueue, { force: true });
-  });
-
-  test('validateSession이 성공이면 executeUploadJob이 호출됨', async () => {
+  test('PENDING job에서 executeUploadJob은 사전 세션 검증 없이 항상 호출됨', async () => {
     const deps = makeMockDeps();
 
     const tmpQueue = path.resolve('/tmp', `test_queue_${Date.now()}.json`);
@@ -244,6 +204,30 @@ describe('T3: 세션 검증 실패 시 업로드 진입 금지', () => {
     await service.processNextJob();
 
     expect(deps.executeUploadJob).toHaveBeenCalledTimes(1);
+    fs.rmSync(tmpQueue, { force: true });
+  });
+
+  test('executeUploadJob이 SESSION_EXPIRED를 반환하면 BLOCKED_LOGIN으로 전환됨', async () => {
+    const deps = makeMockDeps({
+      executeUploadJob: jest.fn().mockResolvedValue({
+        ok: false,
+        reasonCode: 'SESSION_EXPIRED' as FailureReasonCode,
+        detail: 'login_redirect',
+        stdout: 'SESSION_EXPIRED',
+        stderr: '',
+      }),
+    });
+
+    const tmpQueue = path.resolve('/tmp', `test_queue_${Date.now()}.json`);
+    fs.writeFileSync(tmpQueue, JSON.stringify({ version: 1, jobs: [makeJob({ status: 'PENDING' })] }, null, 2));
+
+    const service = new WorkerService({ ...baseConfig, queuePath: tmpQueue }, deps);
+    await service.processNextJob();
+
+    // executeUploadJob은 호출됨 (사전 검증 없음)
+    expect(deps.executeUploadJob).toHaveBeenCalledTimes(1);
+    // 결과적으로 BLOCKED_LOGIN 안내 전송
+    expect(deps.notifyAdmin).toHaveBeenCalled();
     fs.rmSync(tmpQueue, { force: true });
   });
 });

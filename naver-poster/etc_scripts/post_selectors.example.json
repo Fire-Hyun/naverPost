@@ -1,0 +1,18 @@
+{
+  "title": [
+    "[contenteditable='true'][placeholder*='제목']",
+    "[role='textbox'][placeholder*='제목']"
+  ],
+  "body": [
+    ".se-main-container [contenteditable='true']",
+    ".se-component-content [contenteditable='true']"
+  ],
+  "draftSave": [
+    "button:has-text('임시저장')",
+    "[data-name='save']"
+  ],
+  "draftSavedSignals": [
+    "text=저장",
+    "text=임시저장"
+  ]
+}

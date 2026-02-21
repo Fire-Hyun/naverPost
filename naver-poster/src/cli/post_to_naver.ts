@@ -9,6 +9,19 @@ import type { Frame, Page } from 'playwright';
 
 import * as log from '../utils/logger';
 import { attachPageDebugCollectors } from '../utils/logger';
+import {
+  acquireJobLock,
+  computeMarkdownBodyHash,
+  deriveJobKey,
+  ensureRetryConsistency,
+  ensureRunIdComment,
+  generateRunId,
+  IdempotencyError,
+  readJobRunState,
+  releaseJobLock,
+  stripRunIdComments,
+  writeJobRunState,
+} from '../common/idempotency';
 import { createDebugRunDir, ensureDebugRootDir } from '../common/debug_paths';
 import { loadPostDirectory, PostDirectory } from '../utils/parser';
 import {
@@ -122,6 +135,9 @@ function classifyExecutionFailure(error: unknown): { category: 'a' | 'b' | 'c' |
     const matched = message.match(/IMAGE_[A-Z_]+/);
     return { category: 'd', reason: (matched?.[0] ?? 'image_upload_failure').toLowerCase() };
   }
+  if (/DUP_RUN_DETECTED|DRAFT_NOT_EMPTY_ABORT|RUN_ID_MISMATCH_RETRY_BLOCKED/i.test(message)) {
+    return { category: 'd', reason: 'idempotency_guard_blocked' };
+  }
   return { category: 'unknown', reason: 'unclassified' };
 }
 
@@ -182,6 +198,71 @@ function buildSectionBlocks(
   }
 
   return buildRenderPlanItems(orderedChunks, anchorPlacements);
+}
+
+type EditorRunMarkerState = {
+  textLength: number;
+  imageCount: number;
+  runIds: string[];
+  runIdCounts: Record<string, number>;
+};
+
+async function getEditorRunMarkerState(frame: Frame): Promise<EditorRunMarkerState> {
+  const markerState = await frame.evaluate(() => {
+    const text = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+    const walker = document.createTreeWalker(document, NodeFilter.SHOW_COMMENT);
+    const runIdCounts: Record<string, number> = {};
+    while (walker.nextNode()) {
+      const value = (walker.currentNode.nodeValue || '').trim();
+      const m = value.match(/^RUN_ID:\s*([A-Za-z0-9_\-]+)/);
+      if (m) {
+        runIdCounts[m[1]] = (runIdCounts[m[1]] ?? 0) + 1;
+      }
+    }
+    return {
+      textLength: text.length,
+      runIds: Object.keys(runIdCounts),
+      runIdCounts,
+    };
+  });
+  const imageState = await getEditorImageState(frame).catch(() => ({ count: 0, refs: [] as string[] }));
+  return {
+    textLength: markerState.textLength,
+    imageCount: imageState.count,
+    runIds: markerState.runIds,
+    runIdCounts: markerState.runIdCounts,
+  };
+}
+
+async function injectRunIdComment(frame: Frame, runId: string): Promise<boolean> {
+  return await frame.evaluate((targetRunId) => {
+    const already = (() => {
+      const walker = document.createTreeWalker(document, NodeFilter.SHOW_COMMENT);
+      while (walker.nextNode()) {
+        const value = (walker.currentNode.nodeValue || '').trim();
+        if (value === `RUN_ID: ${targetRunId}`) return true;
+      }
+      return false;
+    })();
+    if (already) return true;
+
+    const root = document.querySelector('#editor') || document.querySelector('.se-components') || document.body;
+    if (!root) return false;
+    root.prepend(document.createComment(`RUN_ID: ${targetRunId}`));
+    return true;
+  }, runId);
+}
+
+async function resetDraftEditorIfRequested(ctx: EditorContext): Promise<void> {
+  const page = ctx.page;
+  try {
+    await ctx.frame.click('.se-components-content, [contenteditable=\"true\"]', { timeout: 3000 });
+  } catch {
+    // ignore; fallback to keyboard anyway
+  }
+  await page.keyboard.press('ControlOrMeta+A').catch(() => undefined);
+  await page.keyboard.press('Backspace').catch(() => undefined);
+  await page.waitForTimeout(200);
 }
 
 // ────────────────────────────────────────────
@@ -438,6 +519,9 @@ interface PostingPipelineReport {
   schema_version: string;
   request_id?: string;
   account_id?: string;
+  run_id?: string;
+  job_key?: string;
+  reason_code?: string;
   storage_state_path?: string;
   mode: 'draft' | 'publish' | 'dry_run';
   started_at: string;
@@ -557,10 +641,71 @@ async function runPosting(options: {
   profileDir?: string;
 }): Promise<PostingPipelineReport> {
   const config = getConfig({ profileDir: options.profileDir });
+  const mode: 'draft' | 'publish' | 'dry_run' = options.publish ? 'publish' : options.dryRun ? 'dry_run' : 'draft';
+  const explicitJobKey = process.env.NAVER_JOB_KEY?.trim() || '';
+  const telegramMessageIdRaw = process.env.NAVER_TELEGRAM_MESSAGE_ID?.trim() || '';
+  const telegramMessageId = telegramMessageIdRaw ? Number(telegramMessageIdRaw) : undefined;
+  const jobKey = deriveJobKey({
+    explicitJobKey,
+    telegramMessageId: Number.isFinite(telegramMessageId) ? telegramMessageId : undefined,
+    dirPath: options.dir,
+    mode,
+  });
+  const retryAttempt = Math.max(0, parseInt(process.env.NAVER_RETRY_ATTEMPT ?? '0', 10));
+  const previousState = readJobRunState(jobKey);
+  const runId = retryAttempt > 0 && previousState?.run_id ? previousState.run_id : generateRunId();
+  const lockResult = acquireJobLock(jobKey, runId);
+  if (!lockResult.ok) {
+    throw new IdempotencyError(lockResult.reasonCode, lockResult.message);
+  }
+  const lockHandle = lockResult.handle;
+  const releaseLockOnExit = () => releaseJobLock(lockHandle);
+  process.once('exit', releaseLockOnExit);
+  process.once('SIGINT', releaseLockOnExit);
+  process.once('SIGTERM', releaseLockOnExit);
+  const markdownPath = path.resolve(options.dir, 'blog_result.md');
+  const markerState = ensureRunIdComment(markdownPath, runId);
+  if (retryAttempt > 0 && markerState.runIdInFile !== runId) {
+    releaseJobLock(lockHandle);
+    throw new IdempotencyError(
+      'RUN_ID_MISMATCH_RETRY_BLOCKED',
+      `retry run_id mismatch in blog_result.md expected=${runId} actual=${markerState.runIdInFile}`,
+    );
+  }
+  const markdownContent = markerState.rawMarkdown;
+  const contentHash = computeMarkdownBodyHash(markdownContent);
+  const markdownBodyLength = stripRunIdComments(markdownContent).trim().length;
+  const runMetaPath = path.resolve(options.dir, 'run_meta.json');
+  fs.writeFileSync(runMetaPath, JSON.stringify({
+    run_id: runId,
+    job_key: jobKey,
+    retry_attempt: retryAttempt,
+    blog_result_path: markdownPath,
+    content_hash: contentHash,
+    updated_at: new Date().toISOString(),
+  }, null, 2), 'utf-8');
+  ensureRetryConsistency({
+    retryAttempt,
+    state: previousState,
+    runId,
+    contentHash,
+  });
+  writeJobRunState({
+    job_key: jobKey,
+    run_id: runId,
+    blog_result_path: markdownPath,
+    content_hash: contentHash,
+    content_length: markdownBodyLength,
+    image_count: 0,
+    updated_at: new Date().toISOString(),
+  });
+
   const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const accountId = process.env.NAVER_ID?.trim() || config.blogId;
   process.env.NAVER_REQUEST_ID = requestId;
   process.env.NAVER_ACCOUNT_ID = accountId;
+  process.env.NAVER_RUN_ID = runId;
+  process.env.NAVER_JOB_KEY = jobKey;
   const storageStateMtime = fs.existsSync(config.storageStatePath)
     ? fs.statSync(config.storageStatePath).mtime.toISOString()
     : 'missing';
@@ -579,6 +724,13 @@ async function runPosting(options: {
   log.info('========================================');
   log.info(`  requestId: ${requestId}`);
   log.info(`  accountId: ${accountId}`);
+  log.info(`  runId: ${runId}`);
+  log.info(`  jobKey: ${jobKey}`);
+  log.info(`  retryAttempt: ${retryAttempt}`);
+  log.info(`  blogResultPath: ${markdownPath}`);
+  log.info(`  contentHash: ${contentHash}`);
+  log.info(`  contentLength: ${markdownBodyLength}`);
+  log.info(`  runMetaPath: ${runMetaPath}`);
   log.info(`  storageStatePath: ${config.storageStatePath}`);
   log.info(`  storageStateMtime: ${storageStateMtime}`);
   const headerMessage = options.publish ? '  네이버 블로그 발행 자동화' : '  네이버 블로그 임시저장 자동화';
@@ -598,8 +750,10 @@ async function runPosting(options: {
     schema_version: '1.0',
     request_id: requestId,
     account_id: accountId,
+    run_id: runId,
+    job_key: jobKey,
     storage_state_path: config.storageStatePath,
-    mode: options.publish ? 'publish' : options.dryRun ? 'dry_run' : 'draft',
+    mode,
     started_at: startedAtIso,
     finished_at: new Date().toISOString(),
     duration_ms: Date.now() - startTime,
@@ -648,6 +802,15 @@ async function runPosting(options: {
   const report: PostingPipelineReport = defaultReport('초기화');
   report.title = postDir.parsed.title;
   report.image_summary.requested_count = postDir.imagePaths.length;
+  writeJobRunState({
+    job_key: jobKey,
+    run_id: runId,
+    blog_result_path: markdownPath,
+    content_hash: contentHash,
+    content_length: markdownBodyLength,
+    image_count: postDir.imagePaths.length,
+    updated_at: new Date().toISOString(),
+  });
   report.steps.A = {
     stage: 'Step A: telegram_image_receive_download',
     status: postDir.imagePaths.length > 0 ? 'success' : 'skipped',
@@ -824,6 +987,17 @@ async function runPosting(options: {
       const text = String((error as any)?.message || error || '');
       if (text.includes('[EDITOR_READY_TIMEOUT]')) {
         await collectTimeoutDebugSafe(currentPage, currentFrame, `stage_timeout_write_page_enter_${Math.floor(writePageBudgetMs / 1000)}s`);
+        // about:srcdoc 또는 세션 손상 감지: 로그인 상태 재확인
+        const loginState = await detectLoginState(page).catch(() => ({
+          state: 'unknown' as const,
+          signal: 'detect_error',
+          url: page.url(),
+        }));
+        if (loginState.state === 'logged_out' || loginState.state === 'unknown') {
+          throw new Error(
+            `[SESSION_INVALID] editor_ready_timeout login_state=${loginState.state} signal=${loginState.signal} url=${loginState.url}`,
+          );
+        }
       }
       throw error;
     });
@@ -843,6 +1017,44 @@ async function runPosting(options: {
       }
       stopWatchdogs();
       process.exit(allOk ? 0 : 1);
+    }
+
+    if (!options.publish) {
+      const guardMode = (process.env.NAVER_DRAFT_GUARD_MODE ?? 'abort').toLowerCase();
+      const preInsertState = await getEditorRunMarkerState(ctx.frame);
+      const notEmpty = preInsertState.textLength > 0 || preInsertState.imageCount > 0 || preInsertState.runIds.length > 0;
+      log.info(
+        `[draft-guard] stage=before_insert run_id=${runId} job_key=${jobKey} text_length=${preInsertState.textLength} image_count=${preInsertState.imageCount} marker_count=${preInsertState.runIds.length}`,
+      );
+
+      if (preInsertState.runIds.includes(runId)) {
+        throw new IdempotencyError('DUP_RUN_DETECTED', `run_id already exists in draft editor: ${runId}`);
+      }
+
+      if (notEmpty) {
+        if (guardMode === 'reset') {
+          log.warn('[draft-guard] editor is not empty; reset mode enabled');
+          await resetDraftEditorIfRequested(ctx);
+          const afterReset = await getEditorRunMarkerState(ctx.frame);
+          const stillNotEmpty = afterReset.textLength > 0 || afterReset.imageCount > 0 || afterReset.runIds.length > 0;
+          if (stillNotEmpty) {
+            throw new IdempotencyError(
+              'DRAFT_NOT_EMPTY_ABORT',
+              `draft guard reset failed text_length=${afterReset.textLength} image_count=${afterReset.imageCount} marker_count=${afterReset.runIds.length}`,
+            );
+          }
+        } else {
+          throw new IdempotencyError(
+            'DRAFT_NOT_EMPTY_ABORT',
+            `draft is not empty text_length=${preInsertState.textLength} image_count=${preInsertState.imageCount} marker_count=${preInsertState.runIds.length}`,
+          );
+        }
+      }
+
+      const markerInjected = await injectRunIdComment(ctx.frame, runId);
+      if (!markerInjected) {
+        throw new IdempotencyError('RUN_ID_MISMATCH_RETRY_BLOCKED', `failed to inject run marker: ${runId}`);
+      }
     }
 
     // Step 3: 제목 입력
@@ -987,6 +1199,9 @@ async function runPosting(options: {
     const imageBlockCount = blockSequence.filter((block) => block.type === 'image').length;
     const postPlan = buildPostPlan(blockSequence, effectiveImagePaths);
     const postPlanState = createPostPlanState();
+    log.info(
+      `[trace] stage=before_insert run_id=${runId} job_key=${jobKey} blog_result_path=${markdownPath} content_hash=${contentHash} content_length=${markdownBodyLength} image_count=${effectiveImagePaths.length}`,
+    );
     log.info(`[plan] blocks=${postPlan.blocks.length} text=${textBlockCount} image=${imageBlockCount}`);
     for (const block of postPlan.blocks) {
       const summary = block.type === 'image'
@@ -1040,6 +1255,9 @@ async function runPosting(options: {
 
     const step4Duration = Date.now() - stepStart;
     log.info(`[timing] step=text_blocks_insert_complete elapsed=${(step4Duration / 1000).toFixed(1)}s`);
+    log.info(
+      `[trace] stage=after_insert run_id=${runId} job_key=${jobKey} blog_result_path=${markdownPath} content_hash=${contentHash} content_length=${markdownBodyLength} image_count=${blockInsertResult.uploaded_image_count}`,
+    );
 
     report.steps.C = {
       stage: 'Step C: naver_image_upload',
@@ -1389,6 +1607,38 @@ async function runPosting(options: {
         },
       };
 
+      if (verification.draft_edit_url) {
+        await withStageTimeout(
+          'draft_reopen_run_marker_check',
+          stepTimeoutSeconds,
+          () => currentPage,
+          () => currentFrame,
+          async () => {
+            await ctx.page.goto(verification.draft_edit_url!, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+          },
+        );
+        const reopenedFrame = await withStageTimeout(
+          'draft_reopen_iframe_get',
+          stepTimeoutSeconds,
+          () => currentPage,
+          () => currentFrame,
+          async () => getEditorFrameOrThrow(ctx.page, config.artifactsDir),
+        );
+        currentFrame = reopenedFrame;
+        ctx.frame = reopenedFrame;
+        const reopenedState = await getEditorRunMarkerState(reopenedFrame);
+        const runMarkerCount = reopenedState.runIdCounts[runId] ?? 0;
+        log.info(
+          `[draft-guard] stage=after_reopen run_id=${runId} job_key=${jobKey} text_length=${reopenedState.textLength} image_count=${reopenedState.imageCount} marker_count=${runMarkerCount}`,
+        );
+        if (runMarkerCount > 1) {
+          throw new IdempotencyError(
+            'DUP_RUN_DETECTED',
+            `draft contains duplicated run markers run_id=${runId} count=${runMarkerCount}`,
+          );
+        }
+      }
+
       const expectedInsertedImages = blockInsertResult.expected_image_count;
       postSaveImageCheck = await verifyImageReferencesInEditor(ctx.frame, expectedInsertedImages, {
         page: ctx.page,
@@ -1489,9 +1739,19 @@ async function runPosting(options: {
     }
     log.info('========================================');
     log.info('[timing] step=process_exit_prepare elapsed=0.0s');
+    log.logStructured('outcome_summary', {
+      stage: 'DONE',
+      final_status: report.overall_status,
+      final_reason_code: (report as any).reason_code ?? null,
+      post_dir: path.basename(options.dir),
+      total_elapsed_ms: Date.now() - startTime,
+    });
     emitReport(report);
     return report;
   } catch (e: any) {
+    const reasonCode = e instanceof IdempotencyError
+      ? e.reasonCode
+      : (typeof e?.reasonCode === 'string' ? e.reasonCode : undefined);
     if (e instanceof SessionBlockedError) {
       await collectTimeoutDebugSafe(currentPage, currentFrame, e.reason, e.loginProbe);
     }
@@ -1516,12 +1776,16 @@ async function runPosting(options: {
     }
     report.finished_at = new Date().toISOString();
     report.duration_ms = Date.now() - startTime;
+    if (reasonCode) {
+      report.reason_code = reasonCode;
+    }
     report.steps.F = report.steps.F.status === 'failed'
       ? report.steps.F
       : {
           stage: 'Step F: draft_save_call',
           status: 'failed',
           message: e?.message ? String(e.message) : '임시저장 단계에서 오류 발생',
+          data: reasonCode ? { reason_code: reasonCode } : undefined,
         };
     report.steps.G = report.steps.G.status === 'failed'
       ? report.steps.G
@@ -1532,9 +1796,18 @@ async function runPosting(options: {
         };
     report.draft_summary = {
       success: false,
-      failure_reason: e?.message ? String(e.message) : '알 수 없는 오류',
+      failure_reason: reasonCode
+        ? `${reasonCode}: ${e?.message ? String(e.message) : '알 수 없는 오류'}`
+        : (e?.message ? String(e.message) : '알 수 없는 오류'),
     };
     report.overall_status = 'FAILED';
+    log.logStructured('outcome_summary', {
+      stage: 'DONE',
+      final_status: report.overall_status,
+      final_reason_code: (report as any).reason_code ?? null,
+      post_dir: path.basename(options.dir),
+      total_elapsed_ms: Date.now() - startTime,
+    });
     emitReport(report);
     throw e;
 
@@ -1546,6 +1819,10 @@ async function runPosting(options: {
     if (session.browser) {
       await session.browser.close().catch(() => undefined);
     }
+    releaseJobLock(lockHandle);
+    process.off('exit', releaseLockOnExit);
+    process.off('SIGINT', releaseLockOnExit);
+    process.off('SIGTERM', releaseLockOnExit);
   }
 }
 
@@ -1698,6 +1975,9 @@ program
 
       process.exit(0);
     } catch (e: any) {
+      if (e instanceof IdempotencyError) {
+        log.error(`[idempotency] reason_code=${e.reasonCode} message=${e.message}`);
+      }
       const diagnosis = classifyExecutionFailure(e);
       log.error(`[diagnostic] category=${diagnosis.category} reason=${diagnosis.reason}`);
       if (diagnosis.category === 'a') {

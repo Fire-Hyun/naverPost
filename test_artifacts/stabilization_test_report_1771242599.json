@@ -1,0 +1,131 @@
+{
+  "timestamp": 1771242599.7988334,
+  "total_duration": 2.3500990867614746,
+  "components_tested": 4,
+  "components_passed": 4,
+  "components_failed": 0,
+  "results": [
+    {
+      "component": "DNS Health Check",
+      "success": true,
+      "duration_seconds": 0.5293376445770264,
+      "details": {
+        "diagnosis_severity": "low",
+        "health_check_passed": true,
+        "system_info": {
+          "platform": "Linux",
+          "is_wsl": true,
+          "dns_servers_count": 1,
+          "systemd_resolved_active": true
+        },
+        "recommendations_count": 0
+      },
+      "error_message": null
+    },
+    {
+      "component": "Naver Map Client",
+      "success": true,
+      "duration_seconds": 1.775019645690918,
+      "details": {
+        "query_results": {
+          "강남역": {
+            "success": true,
+            "places_found": 3,
+            "cache_hit": false,
+            "has_coordinates": true
+          },
+          "홍대입구": {
+            "success": true,
+            "places_found": 3,
+            "cache_hit": false,
+            "has_coordinates": true
+          },
+          "잘못된검색어12345": {
+            "success": true,
+            "places_found": 0,
+            "cache_hit": false,
+            "has_coordinates": false
+          }
+        },
+        "cache_performance": {
+          "cache_hit_duration": 4.410743713378906e-05,
+          "cache_working": true
+        },
+        "client_status": {
+          "rate_limiter_active": true,
+          "cache_size": 3
+        }
+      },
+      "error_message": null
+    },
+    {
+      "component": "Image Processing",
+      "success": true,
+      "duration_seconds": 0.04270792007446289,
+      "details": {
+        "optimization_success": true,
+        "size_reduction": {
+          "original_dimensions": [
+            2048,
+            2048
+          ],
+          "optimized_dimensions": [
+            2048,
+            2048
+          ],
+          "original_file_size": 66165,
+          "optimized_file_size": 66165,
+          "compression_ratio": 1.0
+        },
+        "metadata_extraction": {
+          "success": true,
+          "has_gps": true
+        },
+        "file_validation": {
+          "optimized_file_exists": true,
+          "valid_image_format": true
+        }
+      },
+      "error_message": null
+    },
+    {
+      "component": "Monitoring Integration",
+      "success": true,
+      "duration_seconds": 0.002053499221801758,
+      "details": {
+        "structured_logging": {
+          "info": {
+            "success": true
+          },
+          "warning": {
+            "success": true
+          },
+          "error": {
+            "success": true
+          },
+          "success": {
+            "success": true
+          }
+        },
+        "metrics_integration": {
+          "correlation_id_generation": {
+            "success": false,
+            "error": "cannot import name 'get_correlation_id' from 'src.utils.structured_logger' (/home/mini/dev/naverPost/src/utils/structured_logger.py)"
+          },
+          "context_manager": {
+            "success": true,
+            "context_manager_working": true
+          },
+          "log_formatting": {
+            "success": true,
+            "data_types_tested": 5,
+            "formatting_working": true
+          }
+        },
+        "log_levels_working": true
+      },
+      "error_message": null
+    }
+  ],
+  "overall_success": true
+}

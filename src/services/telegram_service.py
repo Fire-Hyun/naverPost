@@ -4,7 +4,9 @@ Combines functionality from run_telegram_bot.py and src/telegram/__main__.py
 """
 
 import asyncio
+import fcntl
 import logging
+import os
 import signal
 import socket
 import sys
@@ -38,6 +40,8 @@ class TelegramBotService:
         self._shutdown_requested = False
         self._current_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_handlers: list[Callable[[], None]] = []
+        self._instance_lock_fd = None
+        self._instance_lock_path = Path("/tmp/naverpost_telegram_bot.lock")
 
     def _load_settings(self):
         """설정 로드 및 검증"""
@@ -100,7 +104,7 @@ class TelegramBotService:
             self.logger.warning(f"DNS check failed for api.telegram.org: {e}")
             print(f"⚠️ DNS check failed for api.telegram.org: {e}")
             print("   - WSL DNS 이슈 가능성이 큽니다.")
-            print("   - 해결: bash scripts/fix_wsl_dns_and_restart_bot.sh")
+            print("   - 해결: bash maintenance/fix_wsl_dns_and_restart_bot.sh")
 
     def _create_bot_instance(self):
         """봇 인스턴스 생성"""
@@ -212,9 +216,62 @@ class TelegramBotService:
         print(f"🔄 Exponential backoff: {self.exponential_backoff}")
         print(f"⏰ Base retry delay: {self.base_retry_delay}s")
 
+    def _acquire_single_instance_lock(self) -> bool:
+        """
+        동일 머신에서 중복 polling 인스턴스 실행을 차단한다.
+        중복 실행 시 Telegram getUpdates Conflict를 유발하므로 즉시 종료.
+        """
+        try:
+            self._instance_lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = open(self._instance_lock_path, "w")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                self.logger.error(
+                    "Another telegram bot instance is already running (lock busy)",
+                    extra={"lock_path": str(self._instance_lock_path)},
+                )
+                print(
+                    "❌ Another bot instance is already running on this host.\n"
+                    "   Duplicate polling causes Telegram Conflict(getUpdates).\n"
+                    f"   lock: {self._instance_lock_path}"
+                )
+                fd.close()
+                return False
+
+            fd.seek(0)
+            fd.truncate(0)
+            fd.write(str(os.getpid()))
+            fd.flush()
+            self._instance_lock_fd = fd
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to acquire instance lock: {e}")
+            print(
+                "❌ Failed to acquire bot instance lock.\n"
+                "   To avoid duplicate polling and session breakage, startup is aborted."
+            )
+            return False
+
+    def _release_single_instance_lock(self) -> None:
+        if not self._instance_lock_fd:
+            return
+        try:
+            fcntl.flock(self._instance_lock_fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            self._instance_lock_fd.close()
+        except Exception:
+            pass
+        self._instance_lock_fd = None
+
     def run(self) -> int:
         """봇 실행 (메인 엔트리 포인트)"""
         try:
+            if not self._acquire_single_instance_lock():
+                return 1
+
             # 1. 시그널 핸들러 설정 (우아한 종료를 위해)
             self._setup_signal_handlers()
 
@@ -251,6 +308,8 @@ class TelegramBotService:
             self.logger.error(f"Failed to start bot service: {e}")
             print(f"❌ Failed to start bot: {e}")
             return 1
+        finally:
+            self._release_single_instance_lock()
 
     def _run_with_retry(self) -> int:
         """재시도 로직으로 봇 실행 (개선된 버전)"""
@@ -298,7 +357,7 @@ class TelegramBotService:
                     print(f"⚠️ Bot runtime error: {e}")
                     print("   - Telegram API 타임아웃입니다.")
                     print("   - DNS/네트워크 연결 확인: getent hosts api.telegram.org")
-                    print("   - WSL인 경우 DNS 복구: bash scripts/fix_wsl_dns_and_restart_bot.sh")
+                    print("   - WSL인 경우 DNS 복구: bash maintenance/fix_wsl_dns_and_restart_bot.sh")
                 else:
                     print(f"⚠️ Bot runtime error: {e}")
 

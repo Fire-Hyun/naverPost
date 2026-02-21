@@ -1,0 +1,38 @@
+{
+  "timestamp": 1771242543.1756134,
+  "total_duration": 0.6323683261871338,
+  "components_tested": 4,
+  "components_passed": 0,
+  "components_failed": 4,
+  "results": [
+    {
+      "component": "DNS Health Check",
+      "success": false,
+      "duration_seconds": 0.5918076038360596,
+      "details": {},
+      "error_message": "'StructuredLogger' object has no attribute 'success'"
+    },
+    {
+      "component": "Naver Map Client",
+      "success": false,
+      "duration_seconds": 0.0002982616424560547,
+      "details": {},
+      "error_message": "StabilizedNaverMapClient.__init__() missing 2 required positional arguments: 'client_id' and 'client_secret'"
+    },
+    {
+      "component": "Image Processing",
+      "success": false,
+      "duration_seconds": 0.03847551345825195,
+      "details": {},
+      "error_message": "'StructuredLogger' object has no attribute 'success'"
+    },
+    {
+      "component": "Monitoring Integration",
+      "success": false,
+      "duration_seconds": 0.0009775161743164062,
+      "details": {},
+      "error_message": "'StructuredLogger' object has no attribute 'success'"
+    }
+  ],
+  "overall_success": false
+}

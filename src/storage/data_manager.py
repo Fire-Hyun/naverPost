@@ -343,6 +343,7 @@ class DateBasedDataManager:
                 "generation_settings": {
                     "target_length": 1500,
                     "tone": "친근하고 자연스러운",
+                    "tone_mode": "neutral_polite_30s",
                     "include_external_info": True,
                     "external_info_ratio": 0.3
                 }

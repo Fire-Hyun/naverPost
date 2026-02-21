@@ -6,9 +6,9 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardR
 from telegram.ext import ContextTypes
 
 from src.config.settings import Settings
-from ..models.session import TelegramSession, ConversationState, LocationInfo
+from ..models.session import TelegramSession, ConversationState, LocationInfo, update_session
 from ..models.responses import ResponseTemplates
-from ..utils.validators import DateValidator
+from ..utils.validators import parse_visit_date
 from ..utils.formatters import ProgressSummaryBuilder
 from ..utils import get_user_logger
 from ..utils.safe_message_mixin import SafeMessageMixin
@@ -40,37 +40,57 @@ class ConversationHandler(SafeMessageMixin):
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: TelegramSession):
         """상태에 따른 텍스트 메시지 처리"""
+        import logging
+        logger = logging.getLogger(__name__)
+
         text = update.message.text.strip()
         session.update_activity()
+
+        user_id = update.effective_user.id
+        user_logger = get_user_logger(user_id)
 
         # 상태별 처리 - 새로운 state handlers 사용
         next_state = None
 
-        if session.state == ConversationState.WAITING_DATE:
-            next_state = await self.date_handler.handle_input(update, session, text)
-        elif session.state == ConversationState.WAITING_CATEGORY:
-            next_state = await self.category_handler.handle_input(update, session, text)
-        elif session.state == ConversationState.WAITING_STORE_NAME:
-            next_state = await self.store_handler.handle_input(update, session, text)
-        elif session.state == ConversationState.WAITING_IMAGES:
-            next_state = await self._handle_waiting_images(update, session, text)
-        elif session.state == ConversationState.WAITING_REVIEW:
-            next_state = await self.review_handler.handle_input(update, session, text)
-        elif session.state == ConversationState.WAITING_ADDITIONAL:
-            next_state = await self.review_handler.handle_additional_input(update, session, text)
-        else:
-            await self.safe_reply_text(update, self.responses.unknown_state())
+        try:
+            if session.state == ConversationState.WAITING_DATE:
+                logger.info(f"[user={user_id}] date input: raw={text!r}, state={session.state.value}")
+                next_state = await self.date_handler.handle_input(update, session, text)
+            elif session.state == ConversationState.WAITING_CATEGORY:
+                next_state = await self.category_handler.handle_input(update, session, text)
+            elif session.state == ConversationState.WAITING_STORE_NAME:
+                next_state = await self.store_handler.handle_input(update, session, text)
+            elif session.state == ConversationState.WAITING_IMAGES:
+                next_state = await self._handle_waiting_images(update, session, text)
+            elif session.state == ConversationState.WAITING_REVIEW:
+                next_state = await self.review_handler.handle_input(update, session, text)
+            elif session.state == ConversationState.WAITING_ADDITIONAL:
+                next_state = await self.review_handler.handle_additional_input(update, session, text)
+            else:
+                await self.safe_reply_text(update, self.responses.unknown_state())
 
-        # 상태 업데이트
-        if next_state is not None:
-            session.state = next_state
+            # 상태 업데이트
+            if next_state is not None:
+                session.state = next_state
+            update_session(session)
+
+        except Exception as e:
+            logger.error(
+                f"[user={user_id}] handle_message error: state={session.state.value}, "
+                f"text={text!r}, error={e}",
+                exc_info=True,
+            )
+            user_logger.error(
+                f"[HANDLE_MESSAGE] {type(e).__name__}: {e} (state={session.state.value}, input={text!r})"
+            )
+            raise  # error_handler에서 사용자 메시지 전송
 
     async def _handle_date_input(self, update: Update, session: TelegramSession, text: str):
         """방문 날짜 입력 처리"""
-        visit_date = DateValidator.parse_date_input(text)
+        visit_date, error_msg = parse_visit_date(text)
 
         if not visit_date:
-            await self.safe_reply_text(update, self.responses.invalid_date_format())
+            await self.safe_reply_text(update, self.responses.invalid_date_format(error_msg))
             return
 
         session.visit_date = visit_date
@@ -299,6 +319,7 @@ class ConversationHandler(SafeMessageMixin):
                 "📍 위치 정보를 받았지만 지금은 위치가 필요한 단계가 아닙니다.",
                 reply_markup=ReplyKeyboardRemove()
             )
+        update_session(session)
 
     async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session: TelegramSession):
         """버튼 클릭 (CallbackQuery) 처리"""
@@ -359,7 +380,8 @@ class ConversationHandler(SafeMessageMixin):
 
         await query.edit_message_text(
             "📅 **방문 날짜를 입력해주세요**\n\n"
-            "형식: YYYYMMDD (예: 20260212)\n"
+            "형식: YYYYMMDD 또는 YYYY-MM-DD (예: 20260212)\n"
+            "'오늘', '어제'도 입력 가능합니다.\n"
             "또는 아래 버튼을 사용하세요.",
             reply_markup=self.responses.create_date_input_keyboard(),
             parse_mode='Markdown'
@@ -390,29 +412,8 @@ class ConversationHandler(SafeMessageMixin):
             parse_mode='Markdown'
         )
 
-        # BlogGenerationService 호출 (기존 로직 재사용)
-        try:
-            from ..service_layer import BlogGenerationService
-            from ..handlers.image_handler import ImageHandler
-
-            # 임시로 ImageHandler 생성 (실제로는 봇에서 전달받아야 함)
-            image_handler = ImageHandler(self.bot)
-            blog_service = BlogGenerationService(image_handler)
-
-            # 가짜 Update 객체 생성 (query에서 message 추출)
-            fake_update = type('FakeUpdate', (), {
-                'message': query.message,
-                'effective_user': query.from_user
-            })()
-
-            await blog_service.generate_blog_from_session(fake_update, session)
-
-        except Exception as e:
-            await query.edit_message_text(
-                f"❌ **블로그 생성 중 오류 발생:**\n\n{str(e)}",
-                reply_markup=self.responses.create_main_menu_keyboard(),
-                parse_mode='Markdown'
-            )
+        # bot의 blog_service 직접 사용 (중복 생성 방지)
+        await self.bot.blog_service.generate_blog_from_session(query.message, session)
 
     async def _handle_check_status(self, query: CallbackQuery, session: TelegramSession):
         """상태 확인"""
@@ -469,30 +470,32 @@ class ConversationHandler(SafeMessageMixin):
 
     async def _handle_date_today(self, query: CallbackQuery, session: TelegramSession):
         """오늘 날짜 사용"""
-        from datetime import datetime
-
-        today = datetime.now().strftime("%Y%m%d")
+        today, _ = parse_visit_date("오늘")
         session.visit_date = today
         session.state = ConversationState.WAITING_CATEGORY
 
+        # 사용자별 로깅
+        user_logger = get_user_logger(query.from_user.id)
+        user_logger.info(f"방문 날짜 입력: {today} (오늘 버튼)")
+
         await query.edit_message_text(
-            f"✅ **방문 날짜:** {today}\n\n**카테고리를 선택해주세요:**",
+            f"✅ 방문 날짜: {today}\n\n카테고리를 선택해주세요:",
             reply_markup=self.responses.create_category_keyboard(self.settings.SUPPORTED_CATEGORIES),
-            parse_mode='Markdown'
         )
 
     async def _handle_date_yesterday(self, query: CallbackQuery, session: TelegramSession):
         """어제 날짜 사용"""
-        from datetime import datetime, timedelta
-
-        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        yesterday, _ = parse_visit_date("어제")
         session.visit_date = yesterday
         session.state = ConversationState.WAITING_CATEGORY
 
+        # 사용자별 로깅
+        user_logger = get_user_logger(query.from_user.id)
+        user_logger.info(f"방문 날짜 입력: {yesterday} (어제 버튼)")
+
         await query.edit_message_text(
-            f"✅ **방문 날짜:** {yesterday}\n\n**카테고리를 선택해주세요:**",
+            f"✅ 방문 날짜: {yesterday}\n\n카테고리를 선택해주세요:",
             reply_markup=self.responses.create_category_keyboard(self.settings.SUPPORTED_CATEGORIES),
-            parse_mode='Markdown'
         )
 
     async def _handle_show_review_tips(self, query: CallbackQuery):

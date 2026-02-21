@@ -3,15 +3,18 @@ import * as path from 'path';
 import { spawn } from 'child_process';
 
 import * as log from '../utils/logger';
-import { resolveProfileDir, backupInvalidStorageState } from '../naver/session';
+import {
+  loadSessionCooldown,
+  isCooldownActive,
+  getSessionCooldownPath,
+} from '../naver/session';
 import { FileJobQueue } from './job_queue';
 import {
   buildBlogResultMarkdown,
   parseTelegramRequest,
   TelegramClient,
 } from './telegram_client';
-import { validateSessionForWorker } from './session_validation';
-import { FailureReasonCode, SessionValidationResult, WorkerJob } from './types';
+import { FailureReasonCode, WorkerJob } from './types';
 
 const DEFAULT_QUEUE_PATH = './.secrets/worker_job_queue.json';
 const DEFAULT_TELEGRAM_STATE_PATH = './.secrets/telegram_worker_state.json';
@@ -30,7 +33,6 @@ type UploadExecutionResult = {
 
 type WorkerDependencies = {
   executeUploadJob: (job: WorkerJob) => Promise<UploadExecutionResult>;
-  validateSession: () => Promise<SessionValidationResult>;
   notifyAdmin: (message: string) => Promise<void>;
   notifyUser: (chatId: string, message: string) => Promise<void>;
 };
@@ -42,11 +44,12 @@ export type WorkerConfig = {
   resume: boolean;
   telegramToken?: string;
   adminChatId?: string;
-  /** interactiveLogin fallback 대기 시간 (ms). 기본 5분 */
-  interactiveLoginTimeoutMs?: number;
 };
 
 function classifyUploadFailure(text: string): FailureReasonCode {
+  if (/DUP_RUN_DETECTED|DRAFT_NOT_EMPTY_ABORT|RUN_ID_MISMATCH_RETRY_BLOCKED/i.test(text)) {
+    return 'DUP_RUN_DETECTED';
+  }
   if (/SESSION_PRECHECK_FAILED|SESSION_EXPIRED|login_redirect|BLOCKED_LOGIN|로그인 필요/i.test(text)) {
     return 'SESSION_EXPIRED';
   }
@@ -100,6 +103,9 @@ function defaultUploadExecutorFactory(projectRoot: string): (job: WorkerJob) => 
         env: {
           ...process.env,
           HEADLESS: 'true',
+          NAVER_JOB_KEY: job.messageId ? `telegram:${job.messageId}` : `worker:${job.id}`,
+          NAVER_TELEGRAM_MESSAGE_ID: job.messageId ? String(job.messageId) : '',
+          NAVER_RETRY_ATTEMPT: String(job.attempts),
         },
       });
       const out: string[] = [];
@@ -128,6 +134,7 @@ function defaultUploadExecutorFactory(projectRoot: string): (job: WorkerJob) => 
         const report = JSON.parse(raw) as {
           request_id?: string;
           account_id?: string;
+          reason_code?: string;
           draft_summary?: { verified_via?: string };
         };
         requestId = report.request_id ?? '';
@@ -181,23 +188,8 @@ export class WorkerService {
     this.telegramClient = config.telegramToken ? new TelegramClient(config.telegramToken) : null;
     this.statePath = path.resolve(DEFAULT_TELEGRAM_STATE_PATH);
 
-    const writeUrl =
-      process.env.NAVER_WRITE_URL ??
-      `https://blog.naver.com/${process.env.NAVER_BLOG_ID || 'jun12310'}?Redirect=Write&`;
-    const profileDir = resolveProfileDir({
-      userDataDir: './.secrets/naver_user_data_dir',
-    });
     const baseDeps: WorkerDependencies = {
       executeUploadJob: defaultUploadExecutorFactory(this.projectRoot),
-      validateSession: async () => await validateSessionForWorker(
-        {
-          profileDir,
-          userDataDir: profileDir,
-          storageStatePath: path.join(profileDir, 'session_storage_state.json'),
-          headless: true,
-        },
-        writeUrl,
-      ),
       notifyAdmin: async (message: string) => {
         if (!this.telegramClient || !this.config.adminChatId) return;
         await this.telegramClient.sendMessage(this.config.adminChatId, message);
@@ -279,88 +271,40 @@ export class WorkerService {
   async resumeBlockedJobsIfSessionReady(): Promise<number> {
     const blocked = this.queue.listByStatus('BLOCKED_LOGIN');
     if (!blocked.length) return 0;
-    const session = await this.deps.validateSession();
-    if (!session.ok) return 0;
-    const resumed = this.queue.moveBlockedToPending();
+
+    // 쿨다운 활성 중이면 resume 스킵
+    const cooldownPath = getSessionCooldownPath();
+    const cooldown = loadSessionCooldown(cooldownPath);
+    if (isCooldownActive(cooldown)) {
+      log.info(`[worker] resumeBlocked: cooldown 활성 until=${new Date(cooldown.cooldownUntilTs).toISOString()} → 스킵`);
+      return 0;
+    }
+
+    // captchaFallbackAttempted=true 제외, 나머지만 PENDING 전환
+    let resumed = 0;
+    for (const job of blocked) {
+      if (job.captchaFallbackAttempted) {
+        log.info(`[worker] resumeBlocked: job=${job.id} captchaFallbackAttempted=true → 스킵`);
+        continue;
+      }
+      this.queue.updateJob(job.id, {
+        status: 'PENDING',
+        lastError: undefined,
+        reasonCode: undefined,
+      });
+      resumed++;
+    }
+
     if (resumed > 0) {
       await this.deps.notifyAdmin(`세션 복구 감지: BLOCKED_LOGIN ${resumed}건을 PENDING으로 전환했습니다.`);
     }
     return resumed;
   }
 
-  /**
-   * CAPTCHA fallback: headed interactiveLogin subprocess로 세션 재획득을 시도한다.
-   * DISPLAY 환경변수가 없으면 즉시 false 반환 (GUI 불가).
-   * DISPLAY가 있으면 headed 브라우저를 열고 interactiveLoginTimeoutMs 후 자동으로 Enter를 전송한다.
-   */
-  private async attemptInteractiveLoginFallback(): Promise<boolean> {
-    const hasDisplay = !!process.env.DISPLAY;
-    log.info(`[worker] CAPTCHA fallback: DISPLAY=${hasDisplay ? process.env.DISPLAY : 'none'}`);
-    if (!hasDisplay) {
-      log.warn('[worker] DISPLAY 없음 → headed interactiveLogin 불가 → 수동 로그인 필요');
-      return false;
-    }
-
-    const timeoutMs = this.config.interactiveLoginTimeoutMs ?? 5 * 60 * 1000;
-    log.info(`[worker] headed interactiveLogin 실행 (timeout=${timeoutMs}ms)`);
-
-    const cliPath = path.resolve(this.projectRoot, 'dist/cli/post_to_naver.js');
-    if (!fs.existsSync(cliPath)) {
-      log.warn(`[worker] CLI 없음: ${cliPath} → interactiveLogin 불가`);
-      return false;
-    }
-
-    return new Promise<boolean>((resolve) => {
-      const child = spawn(process.execPath, [cliPath, '--interactiveLogin'], {
-        cwd: this.projectRoot,
-        env: { ...process.env, HEADLESS: 'false' },
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-
-      const out: string[] = [];
-      const err: string[] = [];
-      child.stdout.on('data', (chunk) => out.push(String(chunk)));
-      child.stderr.on('data', (chunk) => err.push(String(chunk)));
-
-      // timeout 후 Enter 전송 (사용자가 GUI에서 로그인 완료했다고 가정)
-      const enterTimer = setTimeout(() => {
-        try {
-          child.stdin.write('\n');
-          child.stdin.end();
-        } catch { /* ignore */ }
-      }, timeoutMs);
-
-      child.on('close', (code) => {
-        clearTimeout(enterTimer);
-        const combined = [...out, ...err].join('');
-        const success = code === 0 && combined.includes('로그인 확인됨');
-        log.info(`[worker] interactiveLogin 종료: code=${code} success=${success}`);
-        resolve(success);
-      });
-    });
-  }
-
   async processNextJob(): Promise<boolean> {
     const job = this.queue.getNextPending();
     if (!job) return false;
     this.queue.updateJob(job.id, { status: 'PROCESSING' });
-
-    const session = await this.deps.validateSession();
-    if (!session.ok) {
-      if (session.reasonCode === 'SESSION_EXPIRED' || session.reasonCode === 'SECURITY_CHALLENGE') {
-        await this.blockJobForLogin(job, session.reasonCode, session.detail, session.artifactsDir);
-        return true;
-      }
-      this.queue.updateJob(job.id, {
-        status: 'FAILED',
-        attempts: job.attempts + 1,
-        reasonCode: session.reasonCode,
-        lastError: session.detail,
-        artifactsDir: session.artifactsDir,
-      });
-      await this.deps.notifyUser(job.chatId, `업로드 실패: ${session.reasonCode ?? 'UNKNOWN'} (${session.detail})`);
-      return true;
-    }
 
     const execution = await this.deps.executeUploadJob(job);
     if (execution.ok) {
@@ -378,55 +322,14 @@ export class WorkerService {
       return true;
     }
 
+    // CAPTCHA/보안 감지 → interactiveLogin fallback 없이 즉시 BLOCKED_LOGIN
+    // 복구는 CLI 수동 실행: node dist/cli/post_to_naver.js --interactiveLogin
     if (execution.reasonCode === 'SECURITY_CHALLENGE') {
-      if (!job.captchaFallbackAttempted) {
-        // 1차 CAPTCHA: interactiveLogin fallback으로 세션 재획득 시도
-        log.info(`[worker] CAPTCHA 감지: job=${job.id} → 세션 재획득 시도`);
-        await this.deps.notifyUser(
-          job.chatId,
-          `⚠️ CAPTCHA 감지 → 세션 재획득 시도 중 (job=${job.id})\n` +
-          (process.env.DISPLAY
-            ? 'GUI 브라우저가 열립니다. 네이버에 직접 로그인 후 대기하세요.'
-            : '서버에서 직접 실행 필요: node dist/cli/post_to_naver.js --interactiveLogin'),
-        );
-
-        // 무효화된 storageState 백업/격리
-        const storageStatePath = path.resolve(
-          this.projectRoot,
-          '.secrets/naver_user_data_dir/session_storage_state.json',
-        );
-        backupInvalidStorageState(storageStatePath);
-
-        const fallbackOk = await this.attemptInteractiveLoginFallback();
-        if (fallbackOk) {
-          log.info(`[worker] CAPTCHA fallback 세션 재획득 성공: job=${job.id} → 재시도`);
-          await this.deps.notifyUser(job.chatId, `✅ 세션 재획득 성공 → 작업 재시도 (job=${job.id})`);
-          // captchaFallbackAttempted=true로 표시하여 2차 CAPTCHA 시 무한 루프 방지
-          this.queue.updateJob(job.id, { status: 'PENDING', captchaFallbackAttempted: true });
-          return true;
-        }
-
-        // fallback 실패(GUI 없음 또는 로그인 미완료) → BLOCKED_LOGIN
-        log.warn(`[worker] CAPTCHA fallback 실패: job=${job.id} → BLOCKED_LOGIN`);
-        await this.blockJobForLogin(
-          job,
-          'SECURITY_CHALLENGE',
-          'CAPTCHA fallback 실패 - 수동 interactiveLogin 필요',
-          execution.artifactsDir,
-        );
-        return true;
-      }
-
-      // 2차 CAPTCHA (captchaFallbackAttempted=true): 무한 루프 방지 → BLOCKED_LOGIN
-      log.error(`[worker] CAPTCHA fallback 재발: job=${job.id} → BLOCKED_LOGIN (쿨다운)`);
-      await this.deps.notifyUser(
-        job.chatId,
-        `❌ CAPTCHA 반복 감지 (job=${job.id})\n세션 쿨다운. 잠시 후 수동 로그인 후 재시도하세요.`,
-      );
+      log.error(`[worker] CAPTCHA/보안 감지: job=${job.id} → 즉시 BLOCKED_LOGIN (운영자 수동 개입 필요)`);
       await this.blockJobForLogin(
         job,
         'SECURITY_CHALLENGE',
-        'CAPTCHA fallback 후에도 CAPTCHA 재발 - 쿨다운',
+        `CAPTCHA/보안 감지 — 수동 interactiveLogin 필요: node dist/cli/post_to_naver.js --interactiveLogin`,
         execution.artifactsDir,
       );
       return true;

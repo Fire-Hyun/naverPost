@@ -51,34 +51,25 @@ class TelegramMessageFormatter:
         """
         안전한 메시지 포매팅
 
+        의도적인 Markdown 포매팅(**bold** 등)을 보존하면서,
+        길이 제한만 적용한다. escape_markdown_basic은 의도적 포매팅까지
+        파괴하므로 사용하지 않는다.
+
         Returns:
             tuple: (formatted_text, safe_parse_mode)
         """
         if not text:
             return text, parse_mode
 
-        try:
-            # 먼저 원본 텍스트로 검증
-            if parse_mode == 'Markdown':
-                # 기본 Markdown 이스케이프 시도
-                escaped_text = TelegramMessageFormatter.escape_markdown_basic(text)
-                return escaped_text, parse_mode
-            elif parse_mode == 'MarkdownV2':
-                # MarkdownV2 이스케이프 시도
-                escaped_text = TelegramMessageFormatter.escape_markdown_v2(text)
-                return escaped_text, parse_mode
-            else:
-                return text, parse_mode
-
-        except Exception:
-            # 이스케이프 실패 시 HTML 모드로 전환 시도
-            try:
-                html_text = TelegramMessageFormatter.convert_to_html(text)
-                return html_text, 'HTML'
-            except Exception:
-                # HTML도 실패하면 plain text로 전송
-                plain_text = TelegramMessageFormatter.strip_markdown(text)
-                return plain_text, None
+        if parse_mode == 'Markdown':
+            # 기본 Markdown: 의도적 포매팅을 그대로 전달
+            # Telegram 기본 Markdown에서는 *bold*, _italic_ 사용
+            # escape는 하지 않음 (의도적 포매팅 파괴 방지)
+            return text, parse_mode
+        elif parse_mode == 'MarkdownV2':
+            return text, parse_mode
+        else:
+            return text, parse_mode
 
     @staticmethod
     def convert_to_html(text: str) -> str:
@@ -143,10 +134,20 @@ def safe_reply_text(message, text: str, parse_mode: str = 'Markdown', **kwargs):
 
 
 async def safe_reply_text_async(message, text: str, parse_mode: str = 'Markdown', **kwargs):
-    """안전한 비동기 텔레그램 메시지 전송"""
+    """안전한 비동기 텔레그램 메시지 전송 (Markdown 실패 시 plain text 폴백)"""
+    import logging
+    _logger = logging.getLogger(__name__)
+
     safe_text, safe_parse_mode = TelegramMessageFormatter.safe_format_message(text, parse_mode)
 
     # 길이 제한 처리
     safe_text = TelegramMessageFormatter.truncate_message(safe_text)
 
-    return await message.reply_text(safe_text, parse_mode=safe_parse_mode, **kwargs)
+    try:
+        return await message.reply_text(safe_text, parse_mode=safe_parse_mode, **kwargs)
+    except Exception as e:
+        # Markdown 파싱 실패 시 plain text 폴백
+        _logger.warning(f"Markdown reply failed ({e}), falling back to plain text")
+        fallback_text = TelegramMessageFormatter.strip_markdown(text)
+        fallback_text = TelegramMessageFormatter.truncate_message(fallback_text)
+        return await message.reply_text(fallback_text, parse_mode=None, **kwargs)

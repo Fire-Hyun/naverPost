@@ -13,6 +13,38 @@ from src.content.models import (
     HashtagRefinementResult, PipelineLogEntry
 )
 
+OLD_TONE_PATTERNS = [
+    r'하옵니다',
+    r'하였으니',
+    r'했네요',
+    r'겠더라고요',
+]
+
+TONE_MODE_NEUTRAL_POLITE_30S = "neutral_polite_30s"
+
+EARLY_ENDING_PATTERNS = [
+    r'다음에\s*만나요',
+    r'총평',
+    r'마무리',
+    r'결론',
+    r'정리',
+    r'감사합니다',
+]
+
+MEANINGLESS_SECTION_PATTERNS = [
+    r'정보\s*없',
+    r'잘\s*모르',
+    r'확인\s*어렵',
+    r'전달할\s*내용이\s*없',
+]
+
+FIRST_PERSON_PATTERNS = [
+    r'저는',
+    r'제가',
+    r'다녀왔어요',
+    r'소개하겠습니다',
+]
+
 
 class HashtagGenerator:
     """해시태그 자동 생성 클래스"""
@@ -444,6 +476,268 @@ class BlogContentGenerator:
         except ImportError:
             raise ImportError("openai 패키지가 설치되지 않았습니다. pip install openai로 설치하세요.")
 
+    @staticmethod
+    def load_ai_additional_scripts(base_dir: Path) -> str:
+        """date 디렉토리에서 ai_additional_scripts 파일 내용을 로드한다."""
+        candidates = [
+            "ai_additional_scripts.md",
+            "ai_additional_scripts.txt",
+            "ai_additional_script.md",
+            "ai_additional_script.txt",
+        ]
+        loaded_chunks: List[str] = []
+        for name in candidates:
+            file_path = base_dir / name
+            if not file_path.exists() or not file_path.is_file():
+                continue
+            try:
+                text = file_path.read_text(encoding="utf-8").strip()
+            except Exception:
+                continue
+            if text:
+                loaded_chunks.append(f"[{name}]\n{text}")
+        return "\n\n".join(loaded_chunks).strip()
+
+    @staticmethod
+    def sanitize_section_heading(raw_title: str, fallback: str) -> str:
+        text = (raw_title or "").strip().strip('"').strip("'")
+        first_line = text.splitlines()[0].strip() if text else ""
+        first_line = re.sub(r'^[*#\-\s]+|[*#\-\s]+$', '', first_line).strip()
+        first_line = re.sub(r'[.!?]+$', '', first_line).strip()
+        if not first_line or len(first_line) < 2 or len(first_line) > 12:
+            return fallback
+        return first_line
+
+    @staticmethod
+    def _apply_tone_guard(text: str) -> str:
+        guarded = text
+        replacements = {
+            "했네요": "했어요",
+            "겠더라고요": "같았어요",
+            "하였으니": "해서",
+            "하옵니다": "합니다",
+            "하였습니다": "했어요",
+            "했습니다": "했어요",
+        }
+        for src, dst in replacements.items():
+            guarded = guarded.replace(src, dst)
+        return guarded
+
+    @staticmethod
+    def _normalize_polite_sentence_endings(text: str) -> str:
+        """반말 종결을 완만한 존댓말 종결로 정규화한다."""
+        normalized_lines: List[str] = []
+        for raw_line in text.splitlines():
+            line = raw_line
+            if not line.strip():
+                normalized_lines.append(raw_line)
+                continue
+            if line.strip().startswith("**") and line.strip().endswith("**"):
+                normalized_lines.append(raw_line)
+                continue
+            if re.search(r'(요\.|니다\.)\s*$', line):
+                normalized_lines.append(line)
+                continue
+            line = re.sub(r'했다\.$', '했어요.', line)
+            line = re.sub(r'였다\.$', '였어요.', line)
+            line = re.sub(r'이다\.$', '입니다.', line)
+            line = re.sub(r'좋다\.$', '좋아요.', line)
+            line = re.sub(r'가능하다\.$', '가능해요.', line)
+            # 여전히 "다."로 끝나는 경우 보수적으로 "요."로 변환
+            line = re.sub(r'([가-힣]+)다\.$', r'\1요.', line)
+            normalized_lines.append(line)
+        return "\n".join(normalized_lines)
+
+    @staticmethod
+    def _tone_ratio(text: str) -> Dict[str, float]:
+        lines = [line.strip() for line in text.splitlines() if line.strip() and not (line.strip().startswith("**") and line.strip().endswith("**"))]
+        if not lines:
+            return {"banmal": 0.0, "polite": 1.0}
+        banmal = 0
+        polite = 0
+        for line in lines:
+            if re.search(r'(요\.|니다\.)\s*$', line):
+                polite += 1
+            elif re.search(r'다\.\s*$', line):
+                banmal += 1
+        total = max(len(lines), 1)
+        return {"banmal": banmal / total, "polite": polite / total}
+
+    @staticmethod
+    def _contains_ending_phrase(text: str) -> bool:
+        return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in EARLY_ENDING_PATTERNS)
+
+    @classmethod
+    def _has_first_person_expression(cls, text: str) -> bool:
+        return any(re.search(pattern, text) for pattern in FIRST_PERSON_PATTERNS)
+
+    @staticmethod
+    def _sentence_count(paragraphs: List[str]) -> int:
+        joined = " ".join(paragraphs).strip()
+        if not joined:
+            return 0
+        sentences = [s.strip() for s in re.split(r'[.!?]\s+', joined) if s.strip()]
+        return len(sentences)
+
+    @classmethod
+    def _has_meaningful_section_content(
+        cls,
+        section_name: str,
+        paragraphs: List[str],
+        merged_data: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if cls._sentence_count(paragraphs) < 2:
+            return False
+        text = " ".join(paragraphs)
+        if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in MEANINGLESS_SECTION_PATTERNS):
+            return False
+
+        merged_data = merged_data or {}
+        source_text = " ".join(
+            [
+                merged_data.get("personal_review", "") or "",
+                merged_data.get("ai_additional_script", "") or "",
+                merged_data.get("ai_additional_scripts", "") or "",
+            ]
+        )
+        if section_name == "주차정보":
+            has_source = bool(re.search(r'주차|parking|발렛|주차장', source_text, flags=re.IGNORECASE))
+            has_content = bool(re.search(r'주차|parking|발렛|주차장', text, flags=re.IGNORECASE))
+            return has_source and has_content
+        if section_name == "비용정보":
+            has_source = bool(re.search(r'비용|가격|요금|원|만원|결제|가성비', source_text, flags=re.IGNORECASE))
+            has_content = bool(re.search(r'비용|가격|요금|원|만원|결제|가성비', text, flags=re.IGNORECASE))
+            return has_source and has_content
+        return True
+
+    @classmethod
+    def _enforce_bold_heading_structure(
+        cls,
+        content: str,
+        merged_data: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """생성 본문을 **소제목** 구조로 정리하고, 정보 없는 섹션은 제거한다."""
+        merged_data = merged_data or {}
+        lines = [line.rstrip() for line in content.splitlines()]
+        hashtag_line = ""
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if lines and lines[-1].strip().startswith("#"):
+            hashtag_line = lines.pop().strip()
+
+        heading_pattern = re.compile(r'^\*\*(.+?)\*\*\s*$')
+        intro: List[str] = []
+        sections: Dict[str, List[str]] = {
+            "첫 방문기": [],
+            "주차정보": [],
+            "비용정보": [],
+            "총평": [],
+        }
+        current_section: Optional[str] = None
+
+        def classify_heading(raw: str) -> str:
+            normalized = cls.sanitize_section_heading(raw, "첫 방문기")
+            if re.search(r'총평|마무리|정리|결론', normalized):
+                return "총평"
+            if re.search(r'주차|parking|발렛|주차장', normalized, flags=re.IGNORECASE):
+                return "주차정보"
+            if re.search(r'비용|가격|요금|조식|금액', normalized):
+                return "비용정보"
+            return "첫 방문기"
+
+        for raw_line in lines:
+            line = cls._apply_tone_guard(raw_line.strip())
+            if not line:
+                continue
+            matched = heading_pattern.match(line)
+            if matched:
+                heading_text = matched.group(1).strip()
+                if heading_text:
+                    current_section = classify_heading(heading_text)
+                continue
+
+            if current_section is None:
+                intro.append(line)
+            else:
+                sections[current_section].append(line)
+
+        # 총평 이전 섹션에서 결론 문구를 제거하고 총평으로 이동
+        moved_to_conclusion: List[str] = []
+        for section_name in ["첫 방문기", "주차정보", "비용정보"]:
+            kept: List[str] = []
+            for paragraph in sections[section_name]:
+                if cls._contains_ending_phrase(paragraph):
+                    stripped = re.sub(r'다음에\s*만나요!?', '', paragraph).strip()
+                    if stripped:
+                        moved_to_conclusion.append(stripped)
+                    continue
+                kept.append(paragraph)
+            sections[section_name] = kept
+        if moved_to_conclusion:
+            sections["총평"].extend(moved_to_conclusion)
+
+        # Fallback 분류: 섹션 내용 부족 시 intro 잔여 문단을 키워드로 이동
+        remaining_intro: List[str] = []
+        for paragraph in intro:
+            if cls._contains_ending_phrase(paragraph):
+                stripped = re.sub(r'다음에\s*만나요!?', '', paragraph).strip()
+                if stripped:
+                    sections["총평"].append(stripped)
+            elif re.search(r'주차|parking|발렛|주차장', paragraph, flags=re.IGNORECASE):
+                sections["주차정보"].append(paragraph)
+            elif re.search(r'비용|가격|요금|원|만원|결제|가성비', paragraph, flags=re.IGNORECASE):
+                sections["비용정보"].append(paragraph)
+            else:
+                remaining_intro.append(paragraph)
+
+        intro = remaining_intro[:2]
+        if not sections["첫 방문기"]:
+            sections["첫 방문기"] = remaining_intro[2:] if len(remaining_intro) > 2 else ["저는 이번에 직접 방문해서 현장 분위기를 중심으로 소개하겠습니다."]
+
+        # 글 초반 1인칭 경험형 문장 보장
+        intro_text = "\n".join(intro + sections["첫 방문기"][:1])
+        if not cls._has_first_person_expression(intro_text):
+            store_name = (merged_data or {}).get("store_name", "이곳")
+            intro.insert(0, f"저는 이번에 {store_name}에 다녀왔어요.")
+
+        # 결론 문구는 총평 마지막으로 이동
+        cleaned_conclusion: List[str] = []
+        for paragraph in sections["총평"]:
+            stripped = re.sub(r'다음에\s*만나요!?', '', paragraph).strip()
+            if stripped:
+                cleaned_conclusion.append(stripped)
+        if not cleaned_conclusion:
+            cleaned_conclusion = ["전체적으로 다시 방문해도 괜찮은 선택이었어요."]
+        sections["총평"] = cleaned_conclusion
+
+        # 정보 없는 섹션 제거 (주차/비용)
+        optional_headings: List[str] = []
+        if cls._has_meaningful_section_content("주차정보", sections["주차정보"], merged_data=merged_data):
+            optional_headings.append("주차정보")
+        elif sections["주차정보"]:
+            sections["첫 방문기"].extend(sections["주차정보"])
+        if cls._has_meaningful_section_content("비용정보", sections["비용정보"], merged_data=merged_data):
+            optional_headings.append("비용정보")
+        elif sections["비용정보"]:
+            sections["첫 방문기"].extend(sections["비용정보"])
+
+        structured_parts: List[str] = []
+        structured_parts.extend(intro)
+        for heading in ["첫 방문기", *optional_headings, "총평"]:
+            structured_parts.append(f"**{heading}**")
+            structured_parts.extend(sections[heading])
+        structured_parts.append("다음에 만나요!")
+        if hashtag_line:
+            structured_parts.append(hashtag_line)
+
+        compact_parts = []
+        for part in structured_parts:
+            cleaned = part.strip()
+            if not cleaned or cleaned == "****":
+                continue
+            compact_parts.append(cleaned)
+        return "\n\n".join(compact_parts)
+
     def _check_content_sufficiency(self, merged_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         입력 충분성을 점수화하여 보강 모드 발동 여부를 결정한다.
@@ -519,6 +813,7 @@ class BlogContentGenerator:
             # 데이터 추출
             merged_data = generation_data["merged_data"]
             settings = generation_data["generation_settings"]
+            tone_mode = settings.get("tone_mode", TONE_MODE_NEUTRAL_POLITE_30S)
 
             # 충분성 체크
             sufficiency = self._check_content_sufficiency(merged_data)
@@ -546,6 +841,7 @@ class BlogContentGenerator:
                 merged_data, settings,
                 review_snippets=review_snippets,
                 sufficiency_result=sufficiency,
+                tone_mode=tone_mode,
             )
 
             # 환경변수에서 OpenAI 설정 로드
@@ -560,7 +856,7 @@ class BlogContentGenerator:
                 messages=[
                     {
                         "role": "system",
-                        "content": self._get_system_prompt()
+                        "content": self._get_system_prompt(tone_mode=tone_mode)
                     },
                     {
                         "role": "user",
@@ -579,7 +875,11 @@ class BlogContentGenerator:
             title, body_content = self._extract_title_from_content(generated_content, merged_data)
 
             # 후처리 (본문만)
-            processed_content = self._post_process_content(body_content, merged_data)
+            processed_content = self._post_process_content(
+                body_content,
+                merged_data,
+                tone_mode=tone_mode,
+            )
 
             # 결과 구성
             location_detail = merged_data.get("location_detail")
@@ -600,6 +900,7 @@ class BlogContentGenerator:
                     "content_score": sufficiency["content_score"],
                     "review_snippets_used": len(review_snippets),
                     "title": title,
+                    "tone_mode": tone_mode,
                 },
                 "quality_metrics": self._calculate_quality_metrics(processed_content, merged_data),
                 "raw_response": generated_content
@@ -613,10 +914,25 @@ class BlogContentGenerator:
                 "timestamp": datetime.now().isoformat()
             }
 
-    def _get_system_prompt(self) -> str:
+    def _get_system_prompt(self, tone_mode: str = TONE_MODE_NEUTRAL_POLITE_30S) -> str:
         """시스템 프롬프트 반환"""
-        return """너는 실제 사람이 직접 방문하고 쓴 네이버 맛집 블로그 작성자다.
+        tone_rule = ""
+        if tone_mode == TONE_MODE_NEUTRAL_POLITE_30S:
+            tone_rule = """
+13. 전체 문체는 30대 중성적인 존댓말 톤으로 통일한다.
+14. 문장 종결은 주로 "~했어요", "~입니다"를 사용한다.
+15. 반말 종결("~이다.", "~했다.", "~좋다.", "~가능하다.")은 금지한다.
+16. 섹션이 바뀌어도 어투를 바꾸지 않는다.
+17. 주차정보/비용정보는 실제 정보가 있을 때만 섹션으로 생성한다.
+18. 정보가 없으면 해당 소제목을 만들지 않는다. 빈 섹션은 금지한다.
+"""
+        return f"""너는 실제 사람이 직접 방문하고 쓴 네이버 맛집 블로그 작성자다.
 블로그 마케팅 AI가 아니다.
+
+[글의 목적]
+- 이 글은 맛집/호텔 등을 소개하는 블로그 글이다.
+- 목표는 정보 전달과 개인적인 소감 전달이다.
+- 작성자는 실제 방문한 사람이며 1인칭 경험형 문장을 자연스럽게 포함한다.
 
 [제목 생성 규칙]
 - 첫 줄에 반드시 "TITLE: 제목내용" 형식으로 제목을 출력하라.
@@ -664,9 +980,13 @@ class BlogContentGenerator:
    - "강력 추천", "꼭 방문해보세요", "완벽", "인생 맛집" 사용 금지
 
 7. 글 전체 톤은 긍정을 유지하되 과하지 않게.
+8. 문체는 30대 중성적인 톤으로 유지하라. "했네요", "겠더라고요", "하옵니다", "하였으니" 같은 올드한 어투 금지.
+9. 소제목은 반드시 단독 라인의 **소제목** 형태로 작성한다.
+10. 결론/인사 문구("다음에 만나요", "마무리", "총평")는 **총평** 섹션 마지막에만 허용한다.
 
-8. 1200자 내외로 작성
-9. 문장 길이를 평균 15자~25자로 유지하라.
+11. 1200자 내외로 작성
+12. 문장 길이를 평균 15자~25자로 유지하라.
+{tone_rule}
 완성도보다 자연스러움을 우선하라.
 약간 어색해도 인간이 쓴 것처럼 보여야 한다.
 
@@ -698,6 +1018,7 @@ class BlogContentGenerator:
         settings: Dict[str, Any],
         review_snippets: Optional[List[str]] = None,
         sufficiency_result: Optional[Dict[str, Any]] = None,
+        tone_mode: str = TONE_MODE_NEUTRAL_POLITE_30S,
     ) -> str:
         """개선된 생성 프롬프트 구성
 
@@ -717,6 +1038,7 @@ class BlogContentGenerator:
         location_detail = merged_data.get("location_detail")
         personal_review = merged_data["personal_review"]
         ai_additional_script = merged_data.get("ai_additional_script", "")
+        ai_additional_scripts = merged_data.get("ai_additional_scripts", "")
         hashtags = merged_data.get("hashtags", [])
         images = merged_data.get("images", [])
         image_tags = merged_data.get("image_tags", [])  # e.g. ["외관", "내부", "음식"]
@@ -733,6 +1055,12 @@ class BlogContentGenerator:
 
         prompt_parts.append(
             "다음 정보를 바탕으로 실제 사람이 쓴 것 같은 자연스러운 네이버 맛집 블로그를 1200자 내외로 작성해라."
+        )
+        prompt_parts.append(
+            "이 글의 목적은 장소 소개(정보 전달)와 개인 소감 전달이며, 실제 방문자의 1인칭 경험형 문장을 반드시 포함해라."
+        )
+        prompt_parts.append(
+            '예: "~를 소개하겠습니다.", "~를 다녀왔어요." 같은 표현을 문맥에 맞게 최소 1회 자연스럽게 사용해라.'
         )
 
         # 방문 정보 (채워진 필드만)
@@ -766,6 +1094,8 @@ class BlogContentGenerator:
         # 추가 요청
         if ai_additional_script:
             prompt_parts.append(f"\n[추가 요청]\n{ai_additional_script}")
+        if ai_additional_scripts:
+            prompt_parts.append(f"\n[ai_additional_scripts 참고자료]\n{ai_additional_scripts}")
 
         # 이미지 마커 지시
         num_images = len(images)
@@ -827,6 +1157,15 @@ class BlogContentGenerator:
 3. 한 문단 최대 3문장
 4. 입력에 있는 정보만 사용 (없는 사실을 추측하지 마라)
 5. 재방문 의사 표현
+6. 소제목은 반드시 단독 라인의 **소제목** 포맷으로 작성 (예: **첫 방문기**)
+7. 기본 섹션은 **첫 방문기**, **총평**이다.
+8. **주차정보**, **비용정보**는 실제 정보가 존재할 때만 생성한다.
+9. 전달할 실질 정보가 없으면 해당 소제목을 생성하지 않는다.
+10. 빈 섹션(문장 2개 미만, 정보 없음 문구)은 금지한다.
+11. 결론 인사("다음에 만나요!")는 **총평** 섹션의 마지막 문장으로만 배치
+12. "했네요", "겠더라고요", "하옵니다", "하였으니" 표현 금지
+13. 섹션이 바뀌어도 30대 중성적 존댓말 톤을 유지
+14. 반말 종결("~이다.", "~했다.", "~좋다.", "~가능하다.") 금지
 
 [금지 표현]
 - "오늘은 소개하려고", "여러분께", "추천드립니다"
@@ -934,7 +1273,12 @@ class BlogContentGenerator:
 
         return title
 
-    def _post_process_content(self, content: str, merged_data: Dict[str, Any]) -> str:
+    def _post_process_content(
+        self,
+        content: str,
+        merged_data: Dict[str, Any],
+        tone_mode: str = TONE_MODE_NEUTRAL_POLITE_30S,
+    ) -> str:
         """자연스러운 네이버 블로그 스타일로 후처리"""
 
         # 1. 불필요한 따옴표 제거
@@ -959,6 +1303,8 @@ class BlogContentGenerator:
             r'소개해\s*드릴게요\s*,?',
             r'총평\s*:?\s*',
             r'결론적으로\s*,?',
+            r'하옵니다\s*,?',
+            r'하였으니\s*,?',
         ]
         for pattern in ai_patterns:
             content = re.sub(pattern, '', content, flags=re.IGNORECASE)
@@ -1011,7 +1357,17 @@ class BlogContentGenerator:
         # 6. 과도한 줄바꿈 정리 (하지만 짧은 문단 유지)
         content = re.sub(r'\n{4,}', '\n\n\n', content)
 
-        # 7. 검증: 이미지 마커 존재 여부
+        # 7. 소제목 구조/결론 위치/문체 보정
+        content = self._enforce_bold_heading_structure(content, merged_data=merged_data)
+        content = self._apply_tone_guard(content)
+        if tone_mode == TONE_MODE_NEUTRAL_POLITE_30S:
+            content = self._normalize_polite_sentence_endings(content)
+            tone_ratio = self._tone_ratio(content)
+            if tone_ratio["banmal"] >= 0.2:
+                # 안전망: 반말 비율이 높으면 한 번 더 정규화
+                content = self._normalize_polite_sentence_endings(content)
+
+        # 8. 검증: 이미지 마커 존재 여부
         image_markers = re.findall(r'\[사진\d+\]', content)
         if not image_markers:
             # 마커가 하나도 없으면 경고 플래그 (content 자체는 유지)
@@ -1020,7 +1376,7 @@ class BlogContentGenerator:
                 "후처리 경고: 이미지 마커가 1개도 없습니다."
             )
 
-        # 8. 검증: 연속 사진 마커 감지
+        # 9. 검증: 연속 사진 마커 감지
         consecutive_pattern = re.findall(r'\[사진\d+\]\s*\n?\s*\[사진\d+\]', content)
         if consecutive_pattern:
             import logging
@@ -1152,6 +1508,22 @@ class DateBasedBlogGenerator:
             base_path = Settings.DATA_DIR / date_directory
             if not base_path.exists():
                 directory_created = True
+
+            additional_scripts = self.content_generator.load_ai_additional_scripts(base_path)
+            merged_data = ai_request_data.get("merged_data", {})
+            if additional_scripts:
+                merged_data["ai_additional_scripts"] = additional_scripts
+                ai_request_data["merged_data"] = merged_data
+                self.data_manager.date_manager.append_log(
+                    date_directory,
+                    "Loaded ai_additional_scripts into generation prompt"
+                )
+            else:
+                self.data_manager.date_manager.append_log(
+                    date_directory,
+                    "ai_additional_scripts file not found; continue with metadata ai_additional_script",
+                    "WARNING"
+                )
 
             self.data_manager.date_manager.append_log(
                 date_directory,

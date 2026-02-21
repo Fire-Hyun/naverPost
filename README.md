@@ -165,14 +165,8 @@ naverPost/
 ├── data/                       ✅ 생성 데이터 저장소 (yyyyMMdd(상호명) 형식)
 ├── uploads/                    ✅ 사용자 업로드 파일
 ├── templates/                  ✅ 글 생성 템플릿
-├── scripts/                    ✅ 실행/유틸 스크립트 모음
-│   ├── restart_web.sh          ✅ 웹 서버 재기동
-│   ├── restart_telegram_bot.sh ✅ 텔레그램 봇 재기동
-│   ├── setup_port_forward.sh   ✅ WSL2 포트포워딩 안내
-│   ├── setup_port_forward.ps1  ✅ WSL2 포트포워딩(Windows PowerShell)
+├── scripts/                    ✅ 테스트/검증/디버그 스크립트
 │   ├── test_structure.py       ✅ 구조 검증 스크립트
-│   ├── simple_test.py          ✅ 날짜 기반 구조 간단 테스트
-│   ├── create_test_images.py   ✅ 테스트 이미지 생성 도구
 │   ├── test_generate.py        ✅ 종합 생성 테스트
 │   ├── test_blog_generation.py ✅ 블로그 생성 테스트
 │   ├── test_quality_validation.py ✅ 품질 검증 테스트
@@ -180,10 +174,22 @@ naverPost/
 │   ├── test_content_checker.py ✅ 콘텐츠 검증 테스트
 │   ├── test_unified_scorer.py  ✅ 통합 스코어링 테스트
 │   └── test_telegram_integration.py 🤖 텔레그램 통합 테스트
+├── etc_scripts/                ✅ 운영(cron/systemd/배치) 스크립트
+│   ├── run_telegram_bot.py     🤖 텔레그램 봇 실행 엔트리포인트
+│   ├── start_bot_with_health_check.py ✅ 시작 전 DNS/네트워크 헬스체크
+│   ├── monitor_bot_health.py   ✅ 주기 헬스 모니터링
+│   ├── fix_dns_issues.py       ✅ DNS 진단/복구
+│   ├── restart_telegram.sh ✅ 텔레그램 봇 재기동
+│   ├── restart_web.sh          ✅ 웹 서버 재기동
+│   ├── naverpost-bot.service   ✅ systemd 서비스 파일
+│   └── install-systemd-service.sh ✅ 서비스 설치 스크립트
+├── maintenance/                ✅ 일회성 fix/migrate 스크립트 보관
+│   ├── fix_wsl_dns_and_restart_bot.sh
+│   ├── fix_telegram_bot.sh
+│   └── rename_directories.py
 ├── tests/                      ✅ (pytest 등) 테스트 디렉토리
 ├── requirements.txt            ✅ 의존성 목록 (텔레그램 봇 포함)
 ├── .env.example                ✅ 환경설정 템플릿
-├── run_telegram_bot.py         🤖 텔레그램 봇 실행 스크립트
 └── (기타 파일들)
 ```
 
@@ -278,7 +284,7 @@ python3 -m src.web.app
 pip install python-telegram-bot==20.7 aiohttp>=3.8.0
 
 # Telegram Bot 실행
-python3 run_telegram_bot.py
+python3 etc_scripts/run_telegram_bot.py
 
 # 또는 모듈로 실행
 python3 -m src.telegram
@@ -289,13 +295,21 @@ python3 -m src.telegram
 개발 중 서버를 빠르게 재기동하려면 아래 스크립트를 사용하세요. (WSL/Linux)
 
 ```bash
-./scripts/restart_web.sh
+./etc_scripts/restart_web.sh
 ```
 
 - 기본 포트는 `.env`의 `WEB_PORT`(기본 8000)를 따릅니다.
 - 로그는 `logs/webserver.out`에 저장됩니다.
 
 브라우저에서 `http://localhost:8000`에 접속하여 웹 인터페이스를 사용할 수 있습니다.
+
+### 4-2. 스크립트 디렉토리 정책
+
+- 운영/자동실행: `etc_scripts/`
+- 테스트/검증: `scripts/`
+- 일회성 보수: `maintenance/`
+
+경로 변경 내역과 crontab 예시는 `docs/scripts.md`를 참고하세요.
 
 ### 5-1. 새로운 자동화 워크플로우 웹 인터페이스 🚀
 
@@ -346,7 +360,7 @@ http://localhost:8000/static/workflow.html
 
 3. **봇 실행**
    ```bash
-   python3 run_telegram_bot.py
+   python3 etc_scripts/run_telegram_bot.py
    ```
 
 #### 📱 사용법
@@ -480,13 +494,13 @@ http://localhost:8000/static/workflow.html
 - 백그라운드 정리 작업 시작/종료 방식 개선
   - `post_init`/`post_shutdown` 훅으로 cleanup task 수명주기 관리
 - 텔레그램 검증 스크립트 오진 개선
-  - `verify_telegram_setup.py`에서 단순 문자열 매칭 대신 실제 import 오류 구분
+  - `scripts/verify_telegram_setup.py`에서 단순 문자열 매칭 대신 실제 import 오류 구분
 - 세션 기반 블로그 생성 오류 수정
   - `DateBasedDataManager.load_metadata()` 누락 메서드 추가
 - 위치 정보 검증 오류 수정
   - `LocationInfo.source` 값 `user_input` -> `text`로 수정
 - WSL DNS 복구/재기동 자동화 스크립트 추가
-  - `scripts/fix_wsl_dns_and_restart_bot.sh`
+  - `maintenance/fix_wsl_dns_and_restart_bot.sh`
   - `api.telegram.org` 해석 문제 대응 및 봇 재시작 절차 자동화
 
 ## 💡 현재 사용 가능한 기능
@@ -791,11 +805,11 @@ python scripts/test_telegram_integration.py
 pytest tests/integration/test_telegram_buttons.py -v
 
 # 🚀 **새로운!** 완전 자동화 워크플로우 통합 테스트
-python test_integrated_workflow.py
+python scripts/test_integrated_workflow.py
 
 # 네이버 임시저장 UI 검증 통합 테스트 (로그인 세션 필요)
 cd naver-poster
-bash scripts/test_draft_save.sh "../data/20260214(자라)"
+bash naver-poster/scripts/test_draft_save.sh "../data/20260214(자라)"
 # 또는
 TEST_DRAFT_DIR="../data/20260214(자라)" npx tsx tests/integration/test_naver_draft_save.ts
 ```
@@ -946,7 +960,7 @@ pytest tests/test_naver_automation.py
 uvicorn src.web.app:app --host 0.0.0.0 --port 8000 --reload
 
 # 텔레그램 봇 방식 (추천)
-python3 run_telegram_bot.py
+python3 etc_scripts/run_telegram_bot.py
 ```
 
 ### 📋 **다음 개발 단계 (우선순위 순)**
@@ -1091,10 +1105,10 @@ python3 -c "from src.storage.data_manager import DataManager; print('DataManager
    pip install python-telegram-bot==20.7 aiohttp>=3.8.0
 
    # 봇 설정 검증
-   python3 verify_telegram_setup.py
+   python3 scripts/verify_telegram_setup.py
 
    # 봇 재기동 (권장)
-   ./scripts/restart_telegram_bot.sh
+   ./etc_scripts/restart_telegram.sh
 
    # 프로세스/로그 확인
    pgrep -af "[r]un_telegram_bot.py"
@@ -1106,7 +1120,7 @@ python3 -c "from src.storage.data_manager import DataManager; print('DataManager
 
    WSL 환경에서 `Timed out` 또는 `api.telegram.org` DNS 오류가 나면:
    ```bash
-   ./scripts/fix_wsl_dns_and_restart_bot.sh
+   ./maintenance/fix_wsl_dns_and_restart_bot.sh
    ```
 
    DNS 연결 상태 빠른 점검:
@@ -1183,7 +1197,7 @@ AI가 입력에 없는 사실(가격, 주차, 영업시간 등)을 임의로 단
 ```bash
 # 두 가지 방식 모두 완전 동작
 python3 -m src.web.app           # 웹 인터페이스
-python3 run_telegram_bot.py      # 텔레그램 봇 (추천)
+python3 etc_scripts/run_telegram_bot.py      # 텔레그램 봇 (추천)
 ```
 
 ### 📋 **다음 개발 목표**

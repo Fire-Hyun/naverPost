@@ -39,12 +39,16 @@ class ResponseTemplates:
         return "활성 세션이 없습니다. 아래 '시작하기' 버튼을 눌러 시작해주세요."
 
     @staticmethod
-    def invalid_date_format() -> str:
+    def invalid_date_format(detail: str = None) -> str:
         """잘못된 날짜 형식 메시지"""
+        if detail:
+            return f"❌ {detail}"
         return (
             "❌ 날짜 형식이 올바르지 않습니다.\n"
-            "YYYYMMDD 형식으로 입력해주세요 (예: 20260212)\n"
-            "또는 '오늘'을 입력하세요."
+            "다음 형식을 사용해주세요:\n"
+            "• YYYYMMDD (예: 20260212)\n"
+            "• YYYY-MM-DD (예: 2026-02-12)\n"
+            "• '오늘', '어제'"
         )
 
     @staticmethod
@@ -194,7 +198,7 @@ class ResponseTemplates:
             "🤖 네이버 블로그 자동 생성 봇 도움말\n\n"
             "📋 사용법:\n"
             "1. 시작하기 버튼 - 새 블로그 포스트 작성 시작\n"
-            "2. 날짜 입력 (YYYYMMDD 또는 '오늘')\n"
+            "2. 날짜 입력 (YYYYMMDD, YYYY-MM-DD, '오늘', '어제')\n"
             "3. 카테고리 선택\n"
             "4. 상호명 입력 (예: '스타벅스 강남점')\n"
             "5. 사진 업로드 (여러 장 가능, GPS 자동 추출)\n"

@@ -11,7 +11,8 @@ export type FailureReasonCode =
   | 'SESSION_EXPIRED'
   | 'SECURITY_CHALLENGE'
   | 'SELECTOR_BROKEN'
-  | 'NETWORK_ERROR';
+  | 'NETWORK_ERROR'
+  | 'DUP_RUN_DETECTED';
 
 export interface WorkerJob {
   id: string;
@@ -41,4 +42,3 @@ export type SessionValidationResult = {
   detail: string;
   artifactsDir?: string;
 };
-

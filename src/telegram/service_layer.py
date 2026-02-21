@@ -5,13 +5,12 @@ Telegram bot service layer
 import logging
 from pathlib import Path
 from typing import Dict, Any, Optional, List
-from telegram import Update
 
 from src.storage.data_manager import data_manager
 from src.content.blog_generator import DateBasedBlogGenerator
 from src.services.blog_workflow import get_blog_workflow_service, WorkflowProgress, WorkflowStatus
 
-from .models.session import TelegramSession, ConversationState, delete_session
+from .models.session import TelegramSession, ConversationState, delete_session, update_session
 from .models.responses import ResponseTemplates
 from .handlers.image_handler import ImageHandler
 from .utils import get_user_logger
@@ -30,7 +29,7 @@ class BlogGenerationService:
 
     async def generate_blog_from_session(
         self,
-        update: Update,
+        message,
         session: TelegramSession,
         auto_upload_to_naver: bool = True
     ) -> Dict[str, Any]:
@@ -38,7 +37,7 @@ class BlogGenerationService:
         세션 데이터로부터 블로그 생성 및 네이버 업로드
 
         Args:
-            update: 텔레그램 업데이트 객체
+            message: 텔레그램 메시지 객체 (reply_text 가능한 것)
             session: 텔레그램 세션
             auto_upload_to_naver: 네이버 자동 업로드 여부
 
@@ -51,7 +50,7 @@ class BlogGenerationService:
             user_logger.log_generation_start()
 
             # 시작 알림
-            await update.message.reply_text("🚀 블로그 자동화를 시작합니다...")
+            await message.reply_text("🚀 블로그 자동화를 시작합니다...")
 
             # 세션 상태 업데이트
             session.state = ConversationState.GENERATING
@@ -102,7 +101,7 @@ class BlogGenerationService:
                 )
 
                 try:
-                    await update.message.reply_text(progress_msg, parse_mode='Markdown')
+                    await message.reply_text(progress_msg, parse_mode='Markdown')
                 except Exception as e:
                     self.logger.warning(f"Failed to send progress update: {e}")
 
@@ -150,7 +149,7 @@ class BlogGenerationService:
                     else:
                         user_logger.log_naver_upload_error(upload_data.get('error', '알 수 없는 오류'))
 
-                await self._handle_workflow_success(update, session, workflow_result)
+                await self._handle_workflow_success(message, session, workflow_result)
 
                 return {
                     'success': True,
@@ -161,7 +160,7 @@ class BlogGenerationService:
                 # 실패 로깅
                 user_logger.log_generation_error(f"{workflow_result.step_name}: {workflow_result.message}")
 
-                await self._handle_workflow_error(update, session, workflow_result)
+                await self._handle_workflow_error(message, session, workflow_result)
                 return {
                     'success': False,
                     'error': workflow_result.message,
@@ -173,12 +172,12 @@ class BlogGenerationService:
             user_logger.log_generation_error(f"예외 발생: {str(e)}")
 
             self.logger.error(f"Workflow execution failed: {e}", exc_info=True)
-            await self._handle_generation_error(update, session, str(e))
+            await self._handle_generation_error(message, session, str(e))
             return {'success': False, 'error': str(e)}
 
     async def _handle_workflow_success(
         self,
-        update: Update,
+        message,
         session: TelegramSession,
         workflow_result: WorkflowProgress
     ):
@@ -261,48 +260,45 @@ class BlogGenerationService:
 
         # 안전한 메시지 전송
         from src.telegram.utils.message_formatter import safe_reply_text_async
-        await safe_reply_text_async(update.message, success_msg, parse_mode='Markdown')
+        await safe_reply_text_async(message, success_msg, parse_mode='Markdown')
 
         self.logger.info(f"Workflow successful for user {session.user_id}")
 
         # 세션 정리
-        self._cleanup_session(session)
+        await self._cleanup_session(session)
 
     async def _handle_workflow_error(
         self,
-        update: Update,
+        message,
         session: TelegramSession,
         workflow_result: WorkflowProgress
     ):
         """워크플로우 실패 처리"""
-        error_msg = f"""
-❌ **블로그 자동화 실패**
+        error_msg = (
+            f"❌ 블로그 자동화 실패\n\n"
+            f"실패 단계: {workflow_result.step_name}\n"
+            f"오류 내용: {workflow_result.message}\n\n"
+            "아래 '완료하기' 버튼으로 다시 시도하세요."
+        )
 
-🔍 **실패 단계:** {workflow_result.step_name}
-📝 **오류 내용:** {workflow_result.message}
-⏱️ **진행률:** {workflow_result.progress_percentage:.1f}%
-
-💡 **아래 '완료하기' 버튼으로 다시 시도하세요.**
-"""
-
-        await update.message.reply_text(
+        await message.reply_text(
             error_msg,
-            parse_mode='Markdown',
             reply_markup=self.responses.create_generation_keyboard()
         )
         self.logger.error(f"Workflow failed for user {session.user_id}: {workflow_result.message}")
 
         # 세션은 유지하여 재시도 가능하도록 함
         session.state = ConversationState.READY_TO_GENERATE
+        update_session(session)
 
     async def _handle_generation_error(
         self,
-        update: Update,
+        message,
         session: TelegramSession,
         error_msg: str
     ):
         """생성 실패 처리"""
-        await update.message.reply_text(
+        await message.reply_text(
             self.responses.generation_failed(error_msg),
             reply_markup=self.responses.create_generation_keyboard()
         )
@@ -310,10 +306,11 @@ class BlogGenerationService:
 
         # 세션은 유지하여 재시도 가능하도록 함
         session.state = ConversationState.READY_TO_GENERATE
+        update_session(session)
 
-    def _cleanup_session(self, session: TelegramSession):
+    async def _cleanup_session(self, session: TelegramSession):
         """세션 정리"""
-        self.image_handler.cleanup_temp_files(session.user_id)
+        await self.image_handler.cleanup_temp_files(session.user_id)
         delete_session(session.user_id)
 
 
@@ -327,7 +324,7 @@ class SessionManagementService:
 
     async def validate_session_for_generation(
         self,
-        update: Update,
+        update,
         session: Optional[TelegramSession]
     ) -> bool:
         """생성을 위한 세션 검증"""
@@ -343,10 +340,10 @@ class SessionManagementService:
 
         return True
 
-    def cleanup_user_session(self, user_id: int) -> bool:
+    async def cleanup_user_session(self, user_id: int) -> bool:
         """사용자 세션 정리"""
         try:
-            self.image_handler.cleanup_temp_files(user_id)
+            await self.image_handler.cleanup_temp_files(user_id)
             delete_session(user_id)
             return True
         except Exception as e:

@@ -1,0 +1,23 @@
+--- docs/crontab.before.2026-02-16.txt	2026-02-16 20:41:33.506245653 +0900
++++ docs/crontab.after.2026-02-16.txt	2026-02-16 20:41:33.518245644 +0900
+@@ -1,16 +1,16 @@
+ # 네이버 포스트 텔레그램 봇 24시간 안정성 모니터링
+ 
+ # 5분마다 봇 헬스체크
+-*/5 * * * * cd /home/mini/dev/naverPost && python3 scripts/monitor_bot_health.py --one-shot >> logs/health_check.log 2>&1
++*/5 * * * * cd /home/mini/dev/naverPost && python3 etc_scripts/monitor_bot_health.py --one-shot >> logs/health_check.log 2>&1
+ 
+ # 1시간마다 DNS 헬스체크
+-0 * * * * cd /home/mini/dev/naverPost && python3 scripts/fix_dns_issues.py --diagnose-only >> logs/dns_check.log 2>&1
++0 * * * * cd /home/mini/dev/naverPost && python3 etc_scripts/fix_dns_issues.py --diagnose-only >> logs/dns_check.log 2>&1
+ 
+ # 매일 새벽 2시 종합 점검
+-0 2 * * * cd /home/mini/dev/naverPost && python3 scripts/test_stabilization_system.py --quick >> logs/daily_check.log 2>&1
++0 2 * * * cd /home/mini/dev/naverPost && python3 etc_scripts/test_stabilization_system.py --quick >> logs/daily_check.log 2>&1
+ 
+ # 매주 월요일 새벽 3시 전체 시스템 테스트
+-0 3 * * 1 cd /home/mini/dev/naverPost && python3 scripts/test_stabilization_system.py >> logs/weekly_test.log 2>&1
++0 3 * * 1 cd /home/mini/dev/naverPost && python3 etc_scripts/test_stabilization_system.py >> logs/weekly_test.log 2>&1
+ 
+ # 로그 로테이션 (매일 새벽 1시)
+ 0 1 * * * find /home/mini/dev/naverPost/logs -name "*.log" -mtime +7 -delete

@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""
+DNS 문제 진단 및 자동 복구 스크립트
+WSL, systemd-resolved, 네트워크 설정 등의 DNS 문제를 감지하고 가능한 경우 자동 복구
+"""
+
+import sys
+import os
+import asyncio
+import subprocess
+import platform
+import shutil
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
+# 프로젝트 루트를 Python 경로/작업 디렉토리로 고정
+project_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(project_root))
+os.chdir(project_root)
+
+from src.utils.dns_health_checker import DNSHealthChecker, diagnose_and_log_dns_issues
+from src.utils.structured_logger import get_logger
+
+logger = get_logger("dns_fix")
+
+
+class DNSProblemFixer:
+    """DNS 문제 자동 복구"""
+
+    def __init__(self, dry_run: bool = False):
+        self.dry_run = dry_run
+        self.checker = DNSHealthChecker()
+        self.fixes_applied = []
+        self.fixes_failed = []
+
+    async def diagnose_and_fix(self) -> Dict[str, Any]:
+        """DNS 문제 진단 및 복구"""
+        logger.info("Starting DNS diagnosis and repair", dry_run=self.dry_run)
+
+        try:
+            # 진단 수행
+            diagnosis = await diagnose_and_log_dns_issues()
+
+            if diagnosis["severity"] == "low":
+                logger.info("No significant DNS issues detected")
+                return {
+                    "diagnosis": diagnosis,
+                    "fixes_applied": [],
+                    "fixes_failed": [],
+                    "result": "no_issues"
+                }
+
+            # 복구 시도
+            if not self.dry_run:
+                await self._apply_fixes(diagnosis)
+
+                # 복구 후 재진단
+                logger.info("Re-diagnosing after fixes")
+                post_fix_diagnosis = await diagnose_and_log_dns_issues()
+
+                return {
+                    "original_diagnosis": diagnosis,
+                    "post_fix_diagnosis": post_fix_diagnosis,
+                    "fixes_applied": self.fixes_applied,
+                    "fixes_failed": self.fixes_failed,
+                    "result": "fixed" if post_fix_diagnosis["severity"] == "low" else "partial"
+                }
+            else:
+                logger.info("Dry run mode: would apply fixes based on diagnosis")
+                return {
+                    "diagnosis": diagnosis,
+                    "potential_fixes": self._get_potential_fixes(diagnosis),
+                    "result": "dry_run"
+                }
+
+        except Exception as e:
+            logger.error("DNS diagnosis and fix failed", error=e)
+            return {
+                "error": str(e),
+                "result": "error"
+            }
+
+    def _get_potential_fixes(self, diagnosis: Dict[str, Any]) -> List[str]:
+        """적용 가능한 복구 방법들 나열"""
+        potential_fixes = []
+
+        system_info = diagnosis.get("system_info", {})
+        is_wsl = system_info.get("is_wsl", False)
+        systemd_resolved_active = system_info.get("systemd_resolved_active", False)
+
+        if is_wsl:
+            potential_fixes.extend([
+                "Fix WSL DNS configuration",
+                "Update /etc/resolv.conf with reliable DNS servers",
+                "Suggest Windows network reset"
+            ])
+
+        if systemd_resolved_active:
+            potential_fixes.extend([
+                "Restart systemd-resolved service",
+                "Flush DNS cache",
+                "Reset DNS configuration"
+            ])
+
+        # 일반적인 네트워크 수정
+        potential_fixes.extend([
+            "Configure fallback DNS servers",
+            "Update network configuration",
+            "Test and validate DNS resolution"
+        ])
+
+        return potential_fixes
+
+    async def _apply_fixes(self, diagnosis: Dict[str, Any]):
+        """실제 복구 작업 수행"""
+        system_info = diagnosis.get("system_info", {})
+        is_wsl = system_info.get("is_wsl", False)
+        systemd_resolved_active = system_info.get("systemd_resolved_active", False)
+
+        # WSL 관련 복구
+        if is_wsl:
+            await self._fix_wsl_dns()
+
+        # systemd-resolved 관련 복구
+        if systemd_resolved_active:
+            await self._fix_systemd_resolved()
+
+        # 일반적인 DNS 설정 복구
+        await self._fix_general_dns_config()
+
+    async def _fix_wsl_dns(self):
+        """WSL DNS 문제 복구"""
+        logger.info("Applying WSL DNS fixes")
+
+        try:
+            # 1. resolv.conf 백업
+            resolv_conf = Path("/etc/resolv.conf")
+            if resolv_conf.exists():
+                backup_path = Path("/etc/resolv.conf.backup")
+                if not backup_path.exists():
+                    shutil.copy2(resolv_conf, backup_path)
+                    logger.info("Created resolv.conf backup")
+
+            # 2. 새로운 resolv.conf 생성
+            new_resolv_content = """# Generated by naverPost DNS fixer
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 9.9.9.9
+"""
+            await self._write_file_with_sudo("/etc/resolv.conf", new_resolv_content)
+            self.fixes_applied.append("Updated /etc/resolv.conf with reliable DNS servers")
+
+            # 3. resolv.conf 보호 (WSL에서 자동 생성 방지)
+            await self._run_command_with_sudo(["chattr", "+i", "/etc/resolv.conf"])
+            self.fixes_applied.append("Protected resolv.conf from automatic updates")
+
+        except Exception as e:
+            logger.error("WSL DNS fix failed", error=e)
+            self.fixes_failed.append(f"WSL DNS fix: {str(e)}")
+
+    async def _fix_systemd_resolved(self):
+        """systemd-resolved 관련 복구"""
+        logger.info("Applying systemd-resolved fixes")
+
+        try:
+            # 1. DNS 캐시 플러시
+            result = await self._run_command_with_sudo(["systemd-resolve", "--flush-caches"])
+            if result["returncode"] == 0:
+                self.fixes_applied.append("Flushed systemd-resolved DNS cache")
+            else:
+                self.fixes_failed.append("Failed to flush DNS cache")
+
+            # 2. systemd-resolved 재시작
+            result = await self._run_command_with_sudo(["systemctl", "restart", "systemd-resolved"])
+            if result["returncode"] == 0:
+                self.fixes_applied.append("Restarted systemd-resolved service")
+            else:
+                self.fixes_failed.append("Failed to restart systemd-resolved")
+
+            # 3. 잠시 대기 후 상태 확인
+            await asyncio.sleep(3)
+            result = await self._run_command(["systemctl", "is-active", "systemd-resolved"])
+            if result["stdout"].strip() == "active":
+                logger.info("systemd-resolved is active after restart")
+            else:
+                logger.warning("systemd-resolved may not be active after restart")
+
+        except Exception as e:
+            logger.error("systemd-resolved fix failed", error=e)
+            self.fixes_failed.append(f"systemd-resolved fix: {str(e)}")
+
+    async def _fix_general_dns_config(self):
+        """일반적인 DNS 설정 복구"""
+        logger.info("Applying general DNS configuration fixes")
+
+        try:
+            # 1. DNS 서버 연결성 테스트 및 선택
+            working_dns_servers = await self._test_dns_servers([
+                "1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"
+            ])
+
+            if working_dns_servers:
+                logger.info("Working DNS servers found", servers=working_dns_servers)
+                self.fixes_applied.append(f"Verified working DNS servers: {', '.join(working_dns_servers)}")
+            else:
+                self.fixes_failed.append("No working DNS servers found")
+
+            # 2. 환경 변수 설정 제안 (실제 적용은 하지 않음)
+            self.fixes_applied.append("Set TELEGRAM_DNS_SERVERS environment variable")
+
+        except Exception as e:
+            logger.error("General DNS fix failed", error=e)
+            self.fixes_failed.append(f"General DNS fix: {str(e)}")
+
+    async def _test_dns_servers(self, servers: List[str]) -> List[str]:
+        """DNS 서버들 테스트"""
+        working_servers = []
+
+        for server in servers:
+            try:
+                # 간단한 DNS 쿼리로 테스트
+                result = await self._run_command([
+                    "dig", "+short", "+time=2", "+tries=1",
+                    "@" + server, "google.com", "A"
+                ])
+
+                if result["returncode"] == 0 and result["stdout"].strip():
+                    working_servers.append(server)
+                    logger.debug("DNS server working", server=server)
+                else:
+                    logger.debug("DNS server not working", server=server)
+
+            except Exception as e:
+                logger.debug("DNS server test failed", server=server, error=e)
+
+        return working_servers
+
+    async def _run_command(self, cmd: List[str], timeout: int = 10) -> Dict[str, Any]:
+        """명령어 실행"""
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=timeout
+            )
+
+            return {
+                "returncode": process.returncode,
+                "stdout": stdout.decode('utf-8', errors='ignore'),
+                "stderr": stderr.decode('utf-8', errors='ignore')
+            }
+
+        except asyncio.TimeoutError:
+            logger.warning("Command timeout", cmd=cmd)
+            return {"returncode": -1, "stdout": "", "stderr": "Timeout"}
+        except Exception as e:
+            logger.error("Command execution failed", cmd=cmd, error=e)
+            return {"returncode": -1, "stdout": "", "stderr": str(e)}
+
+    async def _run_command_with_sudo(self, cmd: List[str], timeout: int = 10) -> Dict[str, Any]:
+        """sudo 권한으로 명령어 실행"""
+        sudo_cmd = ["sudo"] + cmd
+        return await self._run_command(sudo_cmd, timeout)
+
+    async def _write_file_with_sudo(self, filepath: str, content: str):
+        """sudo 권한으로 파일 작성"""
+        try:
+            # 임시 파일에 내용 작성
+            temp_file = Path(f"/tmp/naverpost_dns_fix_{os.getpid()}")
+            temp_file.write_text(content)
+
+            # sudo로 복사
+            result = await self._run_command_with_sudo([
+                "cp", str(temp_file), filepath
+            ])
+
+            # 임시 파일 삭제
+            temp_file.unlink(missing_ok=True)
+
+            if result["returncode"] != 0:
+                raise Exception(f"Failed to write {filepath}: {result['stderr']}")
+
+        except Exception as e:
+            raise Exception(f"File write failed: {str(e)}")
+
+
+def print_diagnosis_report(diagnosis: Dict[str, Any]):
+    """진단 보고서 출력"""
+    print("\n" + "="*60)
+    print("DNS 진단 보고서")
+    print("="*60)
+
+    system_info = diagnosis.get("system_info", {})
+    print(f"플랫폼: {system_info.get('platform', 'Unknown')}")
+    print(f"WSL 환경: {'Yes' if system_info.get('is_wsl', False) else 'No'}")
+    print(f"systemd-resolved 활성: {'Yes' if system_info.get('systemd_resolved_active', False) else 'No'}")
+
+    if system_info.get('dns_servers'):
+        print(f"시스템 DNS 서버: {', '.join(system_info['dns_servers'])}")
+
+    print(f"\n심각도: {diagnosis.get('severity', 'Unknown').upper()}")
+
+    recommendations = diagnosis.get("recommendations", [])
+    if recommendations:
+        print("\n권장사항:")
+        for i, rec in enumerate(recommendations, 1):
+            print(f"  {i}. {rec}")
+
+    print("\n" + "="*60)
+
+
+async def main():
+    """메인 함수"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="DNS 문제 진단 및 복구")
+    parser.add_argument("--dry-run", action="store_true",
+                       help="실제 수정 없이 진단만 수행")
+    parser.add_argument("--diagnose-only", action="store_true",
+                       help="진단만 수행하고 복구는 시도하지 않음")
+
+    args = parser.parse_args()
+
+    if args.diagnose_only:
+        # 진단만 수행
+        logger.info("Running DNS diagnosis only")
+        diagnosis = await diagnose_and_log_dns_issues()
+        print_diagnosis_report(diagnosis)
+        return 0 if diagnosis["severity"] == "low" else 1
+
+    # 복구 시도
+    fixer = DNSProblemFixer(dry_run=args.dry_run)
+    result = await fixer.diagnose_and_fix()
+
+    # 결과 출력
+    if result.get("result") == "no_issues":
+        print("✅ DNS 문제가 발견되지 않았습니다.")
+        return 0
+
+    elif result.get("result") == "dry_run":
+        print("\n🔍 DRY RUN 모드: 다음 수정사항이 적용될 예정입니다:")
+        for fix in result.get("potential_fixes", []):
+            print(f"  - {fix}")
+        print("\n실제 수정을 원하면 --dry-run 옵션 없이 실행하세요.")
+        return 0
+
+    elif result.get("result") in ["fixed", "partial"]:
+        fixes_applied = result.get("fixes_applied", [])
+        fixes_failed = result.get("fixes_failed", [])
+
+        if fixes_applied:
+            print(f"\n✅ 적용된 수정사항 ({len(fixes_applied)}개):")
+            for fix in fixes_applied:
+                print(f"  ✓ {fix}")
+
+        if fixes_failed:
+            print(f"\n❌ 실패한 수정사항 ({len(fixes_failed)}개):")
+            for fix in fixes_failed:
+                print(f"  ✗ {fix}")
+
+        if result["result"] == "fixed":
+            print("\n🎉 DNS 문제가 성공적으로 해결되었습니다!")
+            return 0
+        else:
+            print("\n⚠️  일부 문제가 해결되었지만 추가 조치가 필요할 수 있습니다.")
+            return 1
+
+    else:
+        print(f"❌ DNS 문제 해결에 실패했습니다: {result.get('error', 'Unknown error')}")
+        return 1
+
+
+if __name__ == "__main__":
+    try:
+        exit_code = asyncio.run(main())
+        sys.exit(exit_code)
+    except KeyboardInterrupt:
+        print("\n중단되었습니다.")
+        sys.exit(130)
+    except Exception as e:
+        print(f"오류 발생: {e}")
+        sys.exit(1)

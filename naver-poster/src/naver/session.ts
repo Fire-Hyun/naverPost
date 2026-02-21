@@ -14,6 +14,8 @@ export interface SessionOptions {
   storageStatePath?: string;
   headless?: boolean;
   slowMo?: number;
+  /** 자동 로그인 정책 (미지정 시 DEFAULT_AUTO_LOGIN_POLICY 사용) */
+  autoLoginPolicy?: Partial<AutoLoginPolicy>;
 }
 
 type OriginStorage = {
@@ -86,6 +88,8 @@ export interface SessionResult {
   page: Page;
   isPersistentProfile: boolean;
   profileDir?: string;
+  /** run 내 자격증명 자동 로그인 시도 여부 — 1회 초과 방지용 */
+  autoLoginAttempted?: boolean;
 }
 
 type ProfileDirResolveInput = {
@@ -177,6 +181,38 @@ export type LoginBlockedReason =
   | 'LOGIN_FORM_STILL_VISIBLE'
   | 'SESSION_BLOCKED_LOGIN_STUCK'
   | 'CROSS_OS_PROFILE_UNUSABLE';
+
+/**
+ * 로그인 상태 머신 — ensureLoggedIn 내부 결정에 사용.
+ * LOGGED_IN        : 세션 유효, 즉시 진행
+ * LOGGED_OUT       : 로그인 폼 존재, 자격증명 시도 가능(정책 허용 시)
+ * CHALLENGE_DETECTED: CAPTCHA/2FA/보안확인/약관 — 자동 입력 금지, 즉시 차단
+ * AMBIGUOUS        : 상태 불명확, 안전을 위해 즉시 차단
+ */
+export type LoginPhase =
+  | 'LOGGED_IN'
+  | 'LOGGED_OUT'
+  | 'CHALLENGE_DETECTED'
+  | 'AMBIGUOUS';
+
+/**
+ * 자동 로그인 정책.
+ * headless 환경에서 ID/PW 자동 입력을 제어한다.
+ */
+export type AutoLoginPolicy = {
+  /** headless 환경에서 자격증명 자동 입력 허용 여부 (기본: false) */
+  enabledInHeadless: boolean;
+  /** 동일 run(세션)에서 최대 자동 로그인 시도 횟수 (기본: 1) */
+  maxAttemptsPerRun: number;
+  /** 6시간 내 최대 자동 로그인 시도 횟수 (기본: 1, 향후 확장용) */
+  maxAttemptsPerSixHours: number;
+};
+
+const DEFAULT_AUTO_LOGIN_POLICY: AutoLoginPolicy = {
+  enabledInHeadless: false,
+  maxAttemptsPerRun: 1,
+  maxAttemptsPerSixHours: 1,
+};
 
 type LoginBlockSignals = {
   captcha: boolean;
@@ -745,6 +781,32 @@ export async function detectLoginState(page: Page): Promise<LoginStateResult> {
   );
 }
 
+/**
+ * 로그인 상태 머신 분류.
+ * detectLoginState() 결과와 차단 신호를 종합하여 LoginPhase를 결정한다.
+ * CHALLENGE_DETECTED는 CAPTCHA/2FA/보안확인/약관을 포함하며, 자동 입력 시도 금지.
+ */
+async function classifyLoginPhase(
+  page: Page,
+  loginState: LoginStateResult,
+): Promise<{ phase: LoginPhase; blockedReason?: LoginBlockedReason }> {
+  if (loginState.state === 'logged_in') {
+    return { phase: 'LOGGED_IN' };
+  }
+  // 차단 신호 우선 확인 (CAPTCHA/2FA 등)
+  const blockSignals = await detectLoginBlockSignals(page);
+  const challengeReason = inferLoginBlockedReason(blockSignals);
+  if (challengeReason && challengeReason !== 'LOGIN_FORM_STILL_VISIBLE') {
+    return { phase: 'CHALLENGE_DETECTED', blockedReason: challengeReason };
+  }
+  // 명확한 로그인 폼
+  if (loginState.state === 'logged_out' || blockSignals.loginFormVisible) {
+    return { phase: 'LOGGED_OUT' };
+  }
+  // 상태 불명확
+  return { phase: 'AMBIGUOUS' };
+}
+
 async function restoreStorageStateToPersistentContext(
   context: BrowserContext,
   storageStatePath: string,
@@ -923,7 +985,16 @@ export async function createPersistentSession(opts: SessionOptions): Promise<Ses
           stageName: 'browser_launch_and_session_load',
         },
       );
-      storageStateLoad = await restoreStorageStateToPersistentContext(context, storageStatePath);
+      // persistent context는 userDataDir 프로필이 단일 진실 원천이다.
+      // storageState JSON 별도 로드 불필요 — 쿠키/세션은 프로필 디렉토리에 이미 있다.
+      storageStateLoad = {
+        loaded: false,
+        mode: 'persistent',
+        path: storageStatePath,
+        exists: false,
+        fileSize: 0,
+        cookieCount: 0,
+      };
       isPersistentProfile = true;
     }
   } catch (error) {
@@ -939,7 +1010,8 @@ export async function createPersistentSession(opts: SessionOptions): Promise<Ses
     throw error;
   }
 
-  if (Object.keys(webStorageSnapshot).length > 0) {
+  // new_context 모드에서만 webStorage 스냅샷 주입 (persistent는 프로필이 단일 진실 원천)
+  if (contextMode === 'new_context' && Object.keys(webStorageSnapshot).length > 0) {
     await context.addInitScript((snapshot: WebStorageSnapshot) => {
       try {
         const current = snapshot[window.location.origin];
@@ -974,6 +1046,23 @@ export async function createPersistentSession(opts: SessionOptions): Promise<Ses
     log.warn('[session] persistent profile disabled: backend=new_context(storageState fallback)');
   }
   log.info(`[timing] step=browser_launch_complete elapsed=${((Date.now() - launchStarted) / 1000).toFixed(1)}s`);
+  // 구조화 session_init 로그 (기존 텍스트 로그와 병행)
+  const storageStateAgeSec = storageStateLoad.exists
+    ? Math.floor((Date.now() - (fs.existsSync(storageStatePath)
+        ? fs.statSync(storageStatePath).mtimeMs : Date.now())) / 1000)
+    : -1;
+  log.logStructured('session_init', {
+    stage: 'SESSION_INIT',
+    profile_dir: userDataDir,
+    context_mode: contextMode,
+    headless,
+    storage_state_exists: storageStateLoad.exists,
+    storage_state_load_reason: storageStateLoad.reason ?? null,
+    storage_state_cookie_count: storageStateLoad.cookieCount,
+    storage_state_age_seconds: storageStateAgeSec,
+    singleton_lock_found: lockInfo.lockDetected,
+    elapsed_ms: Date.now() - launchStarted,
+  });
   return {
     browser,
     context,
@@ -1123,6 +1212,17 @@ export async function ensureLoggedIn(
   const cooldownPath = getSessionCooldownPath(opts.userDataDir);
   const cooldownState = loadSessionCooldown(cooldownPath);
   const { page, context } = session;
+  const headless = opts.headless ?? (process.env.HEADLESS !== 'false');
+  const policy: AutoLoginPolicy = { ...DEFAULT_AUTO_LOGIN_POLICY, ...opts.autoLoginPolicy };
+
+  // ── 정책 지표 로그 ──────────────────────────────────────────────
+  log.info(
+    `[auto_login_policy] enabled_in_headless=${policy.enabledInHeadless} ` +
+    `max_attempts_per_run=${policy.maxAttemptsPerRun} ` +
+    `headless=${headless} cooldown_active=${isCooldownActive(cooldownState)}`,
+  );
+
+  // ── Cross-OS 프로필 체크 ─────────────────────────────────────────
   const cookieNames = (await context.cookies('https://www.naver.com').catch(() => []))
     .map((c) => c.name);
   if (detectCrossOsProfileUnusable(process.platform, session.profileDir ?? opts.userDataDir, cookieNames)) {
@@ -1130,23 +1230,14 @@ export async function ensureLoggedIn(
     log.error(`[session] guide=${crossOsGuidance()}`);
     const reason: LoginBlockedReason = 'CROSS_OS_PROFILE_UNUSABLE';
     const blockedError = await buildSessionBlockedError(
-      page,
-      writeUrl,
-      false,
-      false,
-      reason,
-      {
-        writeUrlReached: false,
-        frameWriteReached: false,
-        gotoRetried: false,
-        loginSignal: 'cross_os_profile_unusable',
-        blockReason: reason,
-      },
+      page, writeUrl, false, false, reason,
+      { writeUrlReached: false, frameWriteReached: false, gotoRetried: false, loginSignal: 'cross_os_profile_unusable', blockReason: reason },
       1_000,
     );
     throw blockedError;
   }
 
+  // ── 글쓰기 URL 이동 및 fast-path 확인 ──────────────────────────
   await navigateToWriter(page, writeUrl).catch(() => undefined);
   const surfaceProbeAfterNavigate = await waitForWriteSurfaceReach(page, writeUrl, 4_000).catch(() => ({
     writeUrlReached: false,
@@ -1158,14 +1249,10 @@ export async function ensureLoggedIn(
       lastReason: cooldownState.lastReason,
       lastTs: cooldownState.lastTs,
     });
-    return {
-      ok: true,
-      loginDetected: true,
-      autoLoginAttempted: false,
-      signal: 'writer_surface_fastpath',
-    };
+    return { ok: true, loginDetected: true, autoLoginAttempted: false, signal: 'writer_surface_fastpath' };
   }
 
+  // ── 로그인 상태 확인 ─────────────────────────────────────────────
   let loginState = await detectLoginState(page);
   if (loginState.state === 'logged_in') {
     saveSessionCooldown(cooldownPath, {
@@ -1176,37 +1263,141 @@ export async function ensureLoggedIn(
     return { ok: true, loginDetected: true, autoLoginAttempted: false, signal: loginState.signal };
   }
 
-  if (mode === 'passive' && isCooldownActive(cooldownState)) {
+  // ── 쿨다운 체크 (mode 무관, 항상 적용) ──────────────────────────
+  if (isCooldownActive(cooldownState)) {
     const reason = cooldownState.lastReason ?? 'SESSION_BLOCKED_LOGIN_STUCK';
     const blockedError = await buildSessionBlockedError(
-      page,
-      writeUrl,
-      false,
-      false,
-      reason,
-      {
-        writeUrlReached: false,
-        frameWriteReached: false,
-        gotoRetried: false,
-        loginSignal: 'cooldown_active',
-        blockReason: reason,
-      },
+      page, writeUrl, false, false, reason,
+      { writeUrlReached: false, frameWriteReached: false, gotoRetried: false, loginSignal: 'cooldown_active', blockReason: reason },
       1_000,
     );
     throw blockedError;
   }
 
-  const attempt = await attemptCredentialLoginOnCurrentPage(page, writeUrl);
-  if (!attempt.success) {
-    const reason = attempt.failureReason ?? 'SESSION_BLOCKED_LOGIN_STUCK';
+  // ── 로그인 상태 머신 분류 ────────────────────────────────────────
+  const { phase, blockedReason: challengeReason } = await classifyLoginPhase(page, loginState);
+  log.logStructured('login_check', {
+    stage: 'LOGIN_CHECK',
+    url: page.url(),
+    login_phase: phase,
+    signal: loginState.signal,
+    cooldown_active: isCooldownActive(cooldownState),
+    cooldown_remaining_sec: Math.max(0, Math.ceil((cooldownState.cooldownUntilTs - Date.now()) / 1000)),
+    consecutive_failures: cooldownState.consecutiveFailures,
+    headless,
+  });
+
+  if (phase === 'CHALLENGE_DETECTED') {
+    const reason = challengeReason!;
+    log.logStructured('auto_login_attempt', {
+      stage: 'AUTO_LOGIN_ATTEMPT',
+      attempted: false,
+      skipped_reason: null,
+      result: 'blocked',
+      blocked_reason: reason,
+      duration_ms: 0,
+      headless,
+      url: page.url(),
+    });
+    // CHALLENGE는 즉시 쿨다운 저장 후 차단
     const nextCooldown = buildCooldownState(cooldownState, reason);
     saveSessionCooldown(cooldownPath, nextCooldown);
     const blockedError = await buildSessionBlockedError(
-      page,
-      writeUrl,
-      attempt.loginDetected,
-      true,
-      reason,
+      page, writeUrl, false, false, reason,
+      { writeUrlReached: false, frameWriteReached: false, gotoRetried: false, loginSignal: `challenge:${reason}`, blockReason: reason },
+    );
+    throw blockedError;
+  }
+
+  if (phase === 'AMBIGUOUS') {
+    log.logStructured('auto_login_attempt', {
+      stage: 'AUTO_LOGIN_ATTEMPT',
+      attempted: false,
+      skipped_reason: null,
+      result: 'blocked',
+      blocked_reason: 'UNKNOWN',
+      duration_ms: 0,
+      headless,
+      url: page.url(),
+      signal: loginState.signal,
+    });
+    const blockedError = await buildSessionBlockedError(
+      page, writeUrl, false, false, 'SESSION_BLOCKED_LOGIN_STUCK',
+      { writeUrlReached: false, frameWriteReached: false, gotoRetried: false, loginSignal: loginState.signal, blockReason: 'SESSION_BLOCKED_LOGIN_STUCK' },
+    );
+    throw blockedError;
+  }
+
+  // ── phase === 'LOGGED_OUT': 자격증명 로그인 정책 적용 ────────────
+  if (headless && !policy.enabledInHeadless) {
+    log.logStructured('auto_login_attempt', {
+      stage: 'AUTO_LOGIN_ATTEMPT',
+      attempted: false,
+      skipped_reason: 'HEADLESS_CREDENTIAL_LOGIN_DISABLED',
+      result: 'skipped',
+      blocked_reason: null,
+      duration_ms: 0,
+      headless,
+      url: page.url(),
+    });
+    const blockedError = await buildSessionBlockedError(
+      page, writeUrl, false, false, 'SESSION_BLOCKED_LOGIN_STUCK',
+      { writeUrlReached: false, frameWriteReached: false, gotoRetried: false, loginSignal: 'headless_credential_login_disabled', blockReason: 'SESSION_BLOCKED_LOGIN_STUCK' },
+      1_000,
+    );
+    throw blockedError;
+  }
+
+  if (session.autoLoginAttempted) {
+    log.logStructured('auto_login_attempt', {
+      stage: 'AUTO_LOGIN_ATTEMPT',
+      attempted: false,
+      skipped_reason: 'MAX_ATTEMPTS_PER_RUN',
+      result: 'skipped',
+      blocked_reason: null,
+      duration_ms: 0,
+      headless,
+      url: page.url(),
+    });
+    const blockedError = await buildSessionBlockedError(
+      page, writeUrl, false, false, 'SESSION_BLOCKED_LOGIN_STUCK',
+      { writeUrlReached: false, frameWriteReached: false, gotoRetried: false, loginSignal: 'max_attempts_per_run', blockReason: 'SESSION_BLOCKED_LOGIN_STUCK' },
+      1_000,
+    );
+    throw blockedError;
+  }
+
+  // ── 자격증명 로그인 1회 시도 ─────────────────────────────────────
+  session.autoLoginAttempted = true;
+  const attemptStartMs = Date.now();
+  log.logStructured('auto_login_attempt', {
+    stage: 'AUTO_LOGIN_ATTEMPT',
+    attempted: true,
+    result: 'pending',
+    skipped_reason: null,
+    blocked_reason: null,
+    duration_ms: 0,
+    headless,
+    url: page.url(),
+    reason_for_attempt: 'logged_out_form_visible',
+  });
+  const attempt = await attemptCredentialLoginOnCurrentPage(page, writeUrl);
+  if (!attempt.success) {
+    const reason = attempt.failureReason ?? 'SESSION_BLOCKED_LOGIN_STUCK';
+    log.logStructured('auto_login_attempt', {
+      stage: 'AUTO_LOGIN_ATTEMPT',
+      attempted: true,
+      result: 'failed',
+      skipped_reason: null,
+      blocked_reason: reason,
+      duration_ms: Date.now() - attemptStartMs,
+      headless,
+      url: page.url(),
+    });
+    const nextCooldown = buildCooldownState(cooldownState, reason);
+    saveSessionCooldown(cooldownPath, nextCooldown);
+    const blockedError = await buildSessionBlockedError(
+      page, writeUrl, attempt.loginDetected, true, reason,
       {
         writeUrlReached: attempt.writeUrlReached,
         frameWriteReached: attempt.frameWriteReached,
@@ -1218,6 +1409,16 @@ export async function ensureLoggedIn(
     throw blockedError;
   }
 
+  log.logStructured('auto_login_attempt', {
+    stage: 'AUTO_LOGIN_ATTEMPT',
+    attempted: true,
+    result: 'success',
+    skipped_reason: null,
+    blocked_reason: null,
+    duration_ms: Date.now() - attemptStartMs,
+    headless,
+    url: page.url(),
+  });
   saveSessionCooldown(cooldownPath, {
     ...DEFAULT_COOLDOWN_STATE,
     lastReason: cooldownState.lastReason,
@@ -1226,12 +1427,7 @@ export async function ensureLoggedIn(
   loginState = await detectLoginState(page);
   if (loginState.state === 'logged_in') {
     await persistSessionState(context, page, getStorageStatePath(opts));
-    return {
-      ok: true,
-      loginDetected: true,
-      autoLoginAttempted: true,
-      signal: loginState.signal,
-    };
+    return { ok: true, loginDetected: true, autoLoginAttempted: true, signal: loginState.signal };
   }
 
   const lateSurfaceProbe = await probeWriteSurface(page, writeUrl).catch(() => ({
@@ -1240,20 +1436,10 @@ export async function ensureLoggedIn(
   }));
   if (lateSurfaceProbe.frameWriteReached && !isLoginRedirectUrl(page.url())) {
     await persistSessionState(context, page, getStorageStatePath(opts)).catch(() => undefined);
-    return {
-      ok: true,
-      loginDetected: true,
-      autoLoginAttempted: true,
-      signal: 'writer_surface_after_login_attempt',
-    };
+    return { ok: true, loginDetected: true, autoLoginAttempted: true, signal: 'writer_surface_after_login_attempt' };
   }
 
-  return {
-    ok: false,
-    loginDetected: false,
-    autoLoginAttempted: true,
-    signal: loginState.signal,
-  };
+  return { ok: false, loginDetected: false, autoLoginAttempted: true, signal: loginState.signal };
 }
 
 export async function persistSessionState(
@@ -1293,8 +1479,19 @@ export async function persistSessionState(
     log.info(
       `[session] storage_state_saved=true path=${summary.path} file_size=${summary.fileSize} cookie_count=${summary.cookieCount}`,
     );
+    log.logStructured('session_persist', {
+      stage: 'SESSION_PERSIST',
+      cookie_count: summary.cookieCount,
+      file_size_bytes: summary.fileSize,
+      success: true,
+    });
   } catch (error) {
     log.warn(`[session] storage_state_saved=false reason=${error}`);
+    log.logStructured('session_persist', {
+      stage: 'SESSION_PERSIST',
+      success: false,
+      error: String(error),
+    });
   }
 }
 

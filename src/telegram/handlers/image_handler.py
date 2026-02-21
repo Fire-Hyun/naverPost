@@ -12,7 +12,7 @@ import logging
 import asyncio
 
 from src.config.settings import Settings
-from ..models.session import TelegramSession, ConversationState, LocationInfo
+from ..models.session import TelegramSession, ConversationState, LocationInfo, update_session
 from ..models.responses import ResponseTemplates
 from ..constants import MIN_IMAGE_SIZE_BYTES, TEMP_FILE_CLEANUP_HOURS
 from ..utils.helpers import ContentTypeDetector
@@ -111,6 +111,7 @@ class ImageHandler(SafeMessageMixin):
                 # 첫 번째 이미지인 경우 상태 업데이트
                 if session.state == ConversationState.WAITING_IMAGES:
                     session.state = ConversationState.WAITING_REVIEW
+                update_session(session)
 
                 # 성공 로깅
                 user_logger.log_image_uploaded(len(session.images), metadata.filename)
@@ -229,6 +230,7 @@ class ImageHandler(SafeMessageMixin):
 
                 if result.status == ResolutionStatus.SUCCESS:
                     session.resolved_store_name = result.resolved_name
+                    update_session(session)
                     confirmation_msg = resolver.get_user_confirmation_message(result)
                     await update.message.reply_text(f"✅ {confirmation_msg}")
 
@@ -329,7 +331,7 @@ class ImageHandler(SafeMessageMixin):
 
             return decimal
 
-        except (TypeError, IndexError, ZeroDivisionError):
+        except (TypeError, IndexError, ZeroDivisionError, ValueError):
             return None
 
     async def cleanup_temp_files(self, user_id: int):
@@ -412,20 +414,6 @@ class ImageHandler(SafeMessageMixin):
         except Exception:
             return False
 
-    def _extract_gps_from_image(self, image_path: Path) -> Optional[LocationInfo]:
-        """레거시 GPS 추출 (하위 호환성)"""
-        try:
-            metadata = asyncio.create_task(self.image_client.processor.extract_metadata(image_path))
-            metadata_result = asyncio.get_event_loop().run_until_complete(metadata)
-
-            if metadata_result.gps_location:
-                lat, lng = metadata_result.gps_location
-                return LocationInfo(lat=lat, lng=lng, source="exif_gps")
-
-            return None
-        except Exception:
-            return None
-
     async def prepare_images_for_data_manager(self, session: TelegramSession) -> List[dict]:
         """DataManager에서 사용할 수 있는 형식으로 이미지 준비 (안정화 버전)"""
         if not session.images:
@@ -454,4 +442,3 @@ class ImageHandler(SafeMessageMixin):
                             error=e,
                             user_id=session.user_id)
             return []
-
